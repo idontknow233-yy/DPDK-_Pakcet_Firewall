@@ -45,7 +45,6 @@ DPDK_Packet_Firewall/
 │   └── 项目架构.md         # 项目总体设计、模块设计、技术难点文档
 ├── project/        # 项目根配置目录【当前目录】
 │   ├── README.md       # 项目说明文档 (本文件)
-│   ├── .gitignore      # Git版本控制忽略文件
 │   ├── meson.build     # 项目主编译配置文件
 │   └── config.ini      # 项目默认配置文件(网卡/核心/内存池配置)
 └── web/            # Web管理界面代码目录
