@@ -42,18 +42,21 @@
 #include <rte_string_fns.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
+#include <rte_ring.h>
+#include <rte_memzone.h>
+#include <rte_atomic.h>
 
 #include "acl/acl.h"
+#include "ipc/acl_ipc.h"
 #include "session/session.h"
-#include "control_command/acl_cmdline.h"
  
 static volatile bool force_quit;
  
 /* MAC updating enabled by default */
 static int mac_updating = 1;
  
-/* Ports set in promiscuous mode off by default. */
-static int promiscuous_on;
+/* Ports set in promiscuous mode on by default. */
+static int promiscuous_on = 1;
  
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
  
@@ -109,10 +112,20 @@ static struct rte_eth_conf port_conf = {
  
 struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 
-static struct acl_ctx acl_ctx;
 static struct session_table session_table;
-static pthread_t acl_cmdline_thread;
- 
+static pthread_t acl_ctrl_thread;
+
+struct acl_runtime {
+	struct acl_ctx ctx[2];
+	rte_atomic32_t active;
+	rte_atomic64_t version;
+};
+
+static struct acl_runtime acl_rt;
+static struct rte_ring *acl_cmd_ring;
+static struct rte_ring *acl_resp_ring;
+static struct acl_shared_cfg *acl_shared_cfg;
+
 /* Per-port statistics struct */
 struct __rte_cache_aligned l2fwd_port_statistics {
 	uint64_t tx;
@@ -125,6 +138,208 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 10; /* default period is 10 seconds */
  
+static int acl_seed_default_rules(struct acl_ctx *ctx) {
+	struct acl_rule deny_private = {
+		.src_ip = rte_be_to_cpu_32(RTE_IPV4(10, 0, 0, 0)),
+		.src_mask = rte_be_to_cpu_32(RTE_IPV4(255, 0, 0, 0)),
+		.dst_ip = 0,
+		.dst_mask = 0,
+		.src_port_min = 0,
+		.src_port_max = 0,
+		.dst_port_min = 0,
+		.dst_port_max = 0,
+		.proto = 0,
+		.match_ports = 0,
+		.allow = 0,
+	};
+	struct acl_rule allow_all = {
+		.src_ip = 0,
+		.src_mask = 0,
+		.dst_ip = 0,
+		.dst_mask = 0,
+		.src_port_min = 0,
+		.src_port_max = 0,
+		.dst_port_min = 0,
+		.dst_port_max = 0,
+		.proto = 0,
+		.match_ports = 0,
+		.allow = 1,
+	};
+	if (acl_add_rule(ctx, &deny_private) != 0) {
+		return -1;
+	}
+	if (acl_add_rule(ctx, &allow_all) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static inline struct acl_ctx *acl_runtime_active_ctx(void) {
+	uint32_t idx = rte_atomic32_read(&acl_rt.active) & 1u;
+	return &acl_rt.ctx[idx];
+}
+
+static int acl_shared_sync(const struct acl_ctx *ctx, uint64_t version) {
+	if (!acl_shared_cfg || !ctx) {
+		return -1;
+	}
+	rte_rwlock_read_lock((rte_rwlock_t *)&ctx->lock);
+	uint32_t count = ctx->count;
+	if (count > ACL_MAX_RULES) {
+		count = ACL_MAX_RULES;
+	}
+	memcpy(acl_shared_cfg->rules, ctx->rules, sizeof(struct acl_rule) * count);
+	acl_shared_cfg->count = count;
+	rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
+	rte_wmb();
+	rte_atomic64_set(&acl_shared_cfg->version, version);
+	return 0;
+}
+
+static int acl_ipc_init(void) {
+	acl_cmd_ring = rte_ring_create(ACL_CMD_RING_NAME, ACL_CMD_RING_SIZE, rte_socket_id(), 0);
+	if (!acl_cmd_ring) {
+		return -1;
+	}
+	acl_resp_ring = rte_ring_create(ACL_RESP_RING_NAME, ACL_RESP_RING_SIZE, rte_socket_id(), 0);
+	if (!acl_resp_ring) {
+		return -1;
+	}
+	const struct rte_memzone *mz = rte_memzone_reserve(ACL_SHARED_CFG_NAME, sizeof(struct acl_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	acl_shared_cfg = mz->addr;
+	memset(acl_shared_cfg, 0, sizeof(*acl_shared_cfg));
+	rte_atomic64_init(&acl_shared_cfg->version);
+	return acl_shared_sync(acl_runtime_active_ctx(), rte_atomic64_read(&acl_rt.version));
+}
+
+static int acl_runtime_init(void) {
+	memset(&acl_rt, 0, sizeof(acl_rt));
+	rte_atomic32_init(&acl_rt.active);
+	rte_atomic64_init(&acl_rt.version);
+	if (acl_init(&acl_rt.ctx[0], ACL_MAX_RULES) != 0) {
+		return -1;
+	}
+	if (acl_init(&acl_rt.ctx[1], ACL_MAX_RULES) != 0) {
+		acl_free(&acl_rt.ctx[0]);
+		return -1;
+	}
+	if (acl_seed_default_rules(&acl_rt.ctx[0]) != 0) {
+		return -1;
+	}
+	if (acl_clone(&acl_rt.ctx[1], &acl_rt.ctx[0]) != 0) {
+		return -1;
+	}
+	rte_atomic32_set(&acl_rt.active, 0);
+	rte_atomic64_set(&acl_rt.version, 1);
+	return 0;
+}
+
+static void acl_runtime_free(void) {
+	acl_free(&acl_rt.ctx[0]);
+	acl_free(&acl_rt.ctx[1]);
+}
+
+static int acl_send_resp(struct acl_cmd_resp *resp) {
+	if (!resp) {
+		return -1;
+	}
+	if (!acl_resp_ring) {
+		rte_free(resp);
+		return -1;
+	}
+	if (rte_ring_enqueue(acl_resp_ring, resp) != 0) {
+		rte_free(resp);
+		return -1;
+	}
+	return 0;
+}
+
+static void acl_send_list(uint32_t seq, const struct acl_ctx *ctx, uint64_t version) {
+	uint32_t count = acl_count(ctx);
+	struct acl_cmd_resp *head = rte_zmalloc(NULL, sizeof(*head), 0);
+	if (!head) {
+		return;
+	}
+	head->seq = seq;
+	head->status = 0;
+	head->count = count;
+	head->version = version;
+	if (acl_send_resp(head) != 0) {
+		return;
+	}
+}
+
+static int acl_apply_cmd(const struct acl_cmd_msg *cmd) {
+	if (!cmd) {
+		return -1;
+	}
+	const struct acl_ctx *active = acl_runtime_active_ctx();
+	uint32_t next_idx = (rte_atomic32_read(&acl_rt.active) ^ 1u) & 1u;
+	struct acl_ctx *next = &acl_rt.ctx[next_idx];
+	if (acl_clone(next, active) != 0) {
+		return -1;
+	}
+	int rc = 0;
+	switch (cmd->type) {
+	case ACL_CMD_ADD:
+		rc = acl_add_rule(next, &cmd->rule);
+		break;
+	case ACL_CMD_DEL:
+		rc = acl_delete_rule(next, cmd->index);
+		break;
+	case ACL_CMD_CLEAR:
+		acl_clear(next);
+		rc = 0;
+		break;
+	default:
+		rc = -1;
+		break;
+	}
+	if (rc != 0) {
+		return -1;
+	}
+	uint64_t version = rte_atomic64_add_return(&acl_rt.version, 1);
+	rte_wmb();
+	rte_atomic32_set(&acl_rt.active, next_idx);
+	acl_shared_sync(next, version);
+	return 0;
+}
+
+static void *acl_ctrl_thread_main(void *arg) {
+	(void)arg;
+	while (!force_quit) {
+		struct acl_cmd_msg *cmd = NULL;
+		if (rte_ring_dequeue(acl_cmd_ring, (void **)&cmd) != 0) {
+			rte_delay_us_sleep(1000);
+			continue;
+		}
+		if (!cmd) {
+			continue;
+		}
+		if (cmd->type == ACL_CMD_LIST) {
+			uint64_t version = rte_atomic64_read(&acl_rt.version);
+			acl_send_list(cmd->seq, acl_runtime_active_ctx(), version);
+			rte_free(cmd);
+			continue;
+		}
+		int status = acl_apply_cmd(cmd);
+		struct acl_cmd_resp *resp = rte_zmalloc(NULL, sizeof(*resp), 0);
+		if (resp) {
+			resp->seq = cmd->seq;
+			resp->status = status;
+			resp->count = acl_count(acl_runtime_active_ctx());
+			resp->version = rte_atomic64_read(&acl_rt.version);
+			acl_send_resp(resp);
+		}
+		rte_free(cmd);
+	}
+	return NULL;
+}
+
 /* Print out statistics on packets dropped */
 static void
 print_stats(void)
@@ -215,7 +430,7 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			if (pkt_len >= ip_offset + ihl) {
 				l4_hdr = (char *)ip + ihl;
 			}
-			if (!acl_check_ipv4(&acl_ctx, ip, l4_hdr)) {
+			if (!acl_check_ipv4(acl_runtime_active_ctx(), ip, l4_hdr)) {
 				rte_pktmbuf_free(m);
 				port_statistics[portid].dropped++;
 				return;
@@ -364,7 +579,7 @@ l2fwd_usage(const char *prgname)
 {
 	printf("%s [EAL options] -- -p PORTMASK [-P] [-q NQ]\n"
 	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
-	       "  -P : Enable promiscuous mode\n"
+	       "  -P : Enable promiscuous mode (default on)\n"
 	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
 	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n"
 	       "  --no-mac-updating: Disable MAC addresses updating (enabled by default)\n"
@@ -719,6 +934,8 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 	argc -= ret;
 	argv += ret;
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
+		rte_exit(EXIT_FAILURE, "Must run as primary process\n");
  
 	force_quit = false;
 	signal(SIGINT, signal_handler);
@@ -829,12 +1046,14 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 	/* >8 End of create the mbuf pool. */
 
-	if (acl_init_default(&acl_ctx) != 0)
-		rte_exit(EXIT_FAILURE, "Cannot init ACL\n");
+	if (acl_runtime_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init ACL runtime\n");
+	if (acl_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init ACL IPC\n");
 	if (session_table_init(&session_table, "session_table", 65536, rte_socket_id()) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init session table\n");
-	if (acl_cmdline_start(&acl_ctx, &acl_cmdline_thread) != 0)
-		rte_exit(EXIT_FAILURE, "Cannot start ACL cmdline\n");
+	if (pthread_create(&acl_ctrl_thread, NULL, acl_ctrl_thread_main, NULL) != 0)
+		rte_exit(EXIT_FAILURE, "Cannot start ACL control thread\n");
  
 	/* Initialise each port */
 	RTE_ETH_FOREACH_DEV(portid) {
@@ -985,9 +1204,9 @@ main(int argc, char **argv)
 		printf(" Done\n");
 	}
  
-	/* clean up the EAL */
-	acl_cmdline_stop(&acl_cmdline_thread);
-	acl_free(&acl_ctx);
+	force_quit = true;
+	pthread_join(acl_ctrl_thread, NULL);
+	acl_runtime_free();
 	session_table_free(&session_table);
 	rte_eal_cleanup();
 	printf("Bye...\n");

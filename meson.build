@@ -3,3 +3,4 @@ project('dpdk_packet_firewall', 'c', version: '0.1.0', default_options: ['c_std=
 dpdk_dep = dependency('libdpdk', required: true)
 
 subdir('dataplane')
+subdir('controlplane')

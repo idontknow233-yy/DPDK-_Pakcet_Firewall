@@ -104,6 +104,40 @@ int acl_get_rule(const struct acl_ctx *ctx, uint32_t index, struct acl_rule *rul
 	return 0;
 }
 
+int acl_clone(struct acl_ctx *dst, const struct acl_ctx *src) {
+	if (!dst || !src) {
+		return -1;
+	}
+	if (!src->rules) {
+		return -1;
+	}
+	rte_rwlock_read_lock((rte_rwlock_t *)&src->lock);
+	uint32_t count = src->count;
+	uint32_t capacity = src->capacity;
+	rte_rwlock_read_unlock((rte_rwlock_t *)&src->lock);
+
+	rte_rwlock_write_lock(&dst->lock);
+	if (!dst->rules || dst->capacity < capacity) {
+		if (dst->rules) {
+			rte_free(dst->rules);
+		}
+		dst->rules = rte_zmalloc("acl_rules", sizeof(struct acl_rule) * capacity, 0);
+		if (!dst->rules) {
+			dst->count = 0;
+			dst->capacity = 0;
+			rte_rwlock_write_unlock(&dst->lock);
+			return -1;
+		}
+		dst->capacity = capacity;
+	}
+	rte_rwlock_read_lock((rte_rwlock_t *)&src->lock);
+	dst->count = src->count;
+	memcpy(dst->rules, src->rules, sizeof(struct acl_rule) * src->count);
+	rte_rwlock_read_unlock((rte_rwlock_t *)&src->lock);
+	rte_rwlock_write_unlock(&dst->lock);
+	return 0;
+}
+
 int acl_init_default(struct acl_ctx *ctx) {
 	if (acl_init(ctx, 16) != 0) {
 		return -1;
@@ -189,9 +223,26 @@ bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, co
 		if (!acl_match_ports(rule, proto, src_port, dst_port)) {
 			continue;
 		}
-		bool allow = rule->allow != 0;
-		rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
-		return allow;
+		if (!rule->allow) {
+			rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < ctx->count; i++) {
+		const struct acl_rule *rule = &ctx->rules[i];
+		if (rule->src_mask && ((src & rule->src_mask) != (rule->src_ip & rule->src_mask))) {
+			continue;
+		}
+		if (rule->dst_mask && ((dst & rule->dst_mask) != (rule->dst_ip & rule->dst_mask))) {
+			continue;
+		}
+		if (!acl_match_ports(rule, proto, src_port, dst_port)) {
+			continue;
+		}
+		if (rule->allow) {
+			rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
+			return true;
+		}
 	}
 	rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
 

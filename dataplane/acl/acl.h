@@ -36,6 +36,7 @@ int acl_delete_rule(struct acl_ctx *ctx, uint32_t index);
 void acl_clear(struct acl_ctx *ctx);
 uint32_t acl_count(const struct acl_ctx *ctx);
 int acl_get_rule(const struct acl_ctx *ctx, uint32_t index, struct acl_rule *rule);
+int acl_clone(struct acl_ctx *dst, const struct acl_ctx *src);
 bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, const void *l4_hdr);
 
 #endif
