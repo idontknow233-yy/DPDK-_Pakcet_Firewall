@@ -112,7 +112,6 @@ int acl_clone(struct acl_ctx *dst, const struct acl_ctx *src) {
 		return -1;
 	}
 	rte_rwlock_read_lock((rte_rwlock_t *)&src->lock);
-	uint32_t count = src->count;
 	uint32_t capacity = src->capacity;
 	rte_rwlock_read_unlock((rte_rwlock_t *)&src->lock);
 
@@ -226,22 +225,6 @@ bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, co
 		if (!rule->allow) {
 			rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
 			return false;
-		}
-	}
-	for (uint32_t i = 0; i < ctx->count; i++) {
-		const struct acl_rule *rule = &ctx->rules[i];
-		if (rule->src_mask && ((src & rule->src_mask) != (rule->src_ip & rule->src_mask))) {
-			continue;
-		}
-		if (rule->dst_mask && ((dst & rule->dst_mask) != (rule->dst_ip & rule->dst_mask))) {
-			continue;
-		}
-		if (!acl_match_ports(rule, proto, src_port, dst_port)) {
-			continue;
-		}
-		if (rule->allow) {
-			rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
-			return true;
 		}
 	}
 	rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);

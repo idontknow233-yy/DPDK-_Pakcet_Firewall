@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <pthread.h>
  
+#include <arpa/inet.h>
 #include <netinet/in.h>
 
 #include <rte_common.h>
@@ -42,12 +43,17 @@
 #include <rte_string_fns.h>
 #include <rte_tcp.h>
 #include <rte_udp.h>
+#include <rte_ip.h>
 #include <rte_ring.h>
 #include <rte_memzone.h>
 #include <rte_atomic.h>
+#include <rte_hash.h>
 
 #include "acl/acl.h"
+#include "arp/arp.h"
 #include "ipc/acl_ipc.h"
+#include "ipc/session_ipc.h"
+#include "route/route.h"
 #include "session/session.h"
  
 static volatile bool force_quit;
@@ -112,7 +118,8 @@ static struct rte_eth_conf port_conf = {
  
 struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 
-static struct session_table session_table;
+static struct session_table session_tables[RTE_MAX_LCORE];
+static uint8_t session_table_inited[RTE_MAX_LCORE];
 static pthread_t acl_ctrl_thread;
 
 struct acl_runtime {
@@ -125,6 +132,20 @@ static struct acl_runtime acl_rt;
 static struct rte_ring *acl_cmd_ring;
 static struct rte_ring *acl_resp_ring;
 static struct acl_shared_cfg *acl_shared_cfg;
+static struct session_shared_cfg *session_shared_cfg;
+static uint64_t session_timeout_tsc;
+
+static struct route_table *ipv4_rt;
+static struct arp_table *arp_tbl;
+static struct arp_ifcfg ifcfgs[RTE_MAX_ETHPORTS];
+static int routing_on;
+
+static struct session_table *session_table_for_lcore(unsigned lcore_id) {
+	if (lcore_id >= RTE_MAX_LCORE || !session_table_inited[lcore_id]) {
+		return NULL;
+	}
+	return &session_tables[lcore_id];
+}
 
 /* Per-port statistics struct */
 struct __rte_cache_aligned l2fwd_port_statistics {
@@ -137,6 +158,17 @@ struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 10; /* default period is 10 seconds */
+
+struct pending_route {
+	uint32_t dst_ip;
+	uint8_t depth;
+	uint32_t next_hop_ip;
+	uint16_t out_port;
+};
+
+#define MAX_PENDING_ROUTES 1024
+static struct pending_route pending_routes[MAX_PENDING_ROUTES];
+static uint32_t pending_route_count;
  
 static int acl_seed_default_rules(struct acl_ctx *ctx) {
 	struct acl_rule deny_private = {
@@ -214,6 +246,54 @@ static int acl_ipc_init(void) {
 	memset(acl_shared_cfg, 0, sizeof(*acl_shared_cfg));
 	rte_atomic64_init(&acl_shared_cfg->version);
 	return acl_shared_sync(acl_runtime_active_ctx(), rte_atomic64_read(&acl_rt.version));
+}
+
+static int session_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(SESSION_SHARED_NAME, sizeof(struct session_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	session_shared_cfg = mz->addr;
+	memset(session_shared_cfg, 0, sizeof(*session_shared_cfg));
+	rte_atomic64_init(&session_shared_cfg->version);
+	return 0;
+}
+
+static int session_shared_sync(uint64_t now_tsc) {
+	if (!session_shared_cfg) {
+		return -1;
+	}
+	uint32_t out = 0;
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		struct session_table *table = session_table_for_lcore(lcore_id);
+		if (!table) {
+			continue;
+		}
+		if (out >= SESSION_MAX_EXPORT) {
+			break;
+		}
+		uint32_t left = SESSION_MAX_EXPORT - out;
+		out += session_export(table, &session_shared_cfg->keys[out], &session_shared_cfg->entries[out], left,
+			now_tsc, session_timeout_tsc);
+	}
+	session_shared_cfg->count = out;
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&session_shared_cfg->version);
+	rte_atomic64_set(&session_shared_cfg->version, v + 1);
+	return 0;
+}
+
+static void session_expire_all(uint64_t now_tsc) {
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		struct session_table *table = session_table_for_lcore(lcore_id);
+		if (!table) {
+			continue;
+		}
+		session_soft_expire(table, now_tsc, session_timeout_tsc);
+	}
 }
 
 static int acl_runtime_init(void) {
@@ -421,6 +501,28 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 	dst_port = l2fwd_dst_ports[portid];
  
 	eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+	if (routing_on) {
+		if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+			uint16_t tx_port = 0;
+			int send_reply = arp_process_packet(arp_tbl, m, (uint16_t)portid, ifcfgs, l2fwd_ports_eth_addr,
+				RTE_MAX_ETHPORTS, &tx_port);
+			if (send_reply) {
+				buffer = tx_buffer[tx_port];
+				sent = rte_eth_tx_buffer(tx_port, 0, buffer, m);
+				if (sent)
+					port_statistics[tx_port].tx += sent;
+				return;
+			}
+			rte_pktmbuf_free(m);
+			port_statistics[portid].dropped++;
+			return;
+		}
+		if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+			rte_pktmbuf_free(m);
+			port_statistics[portid].dropped++;
+			return;
+		}
+	}
 	if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
 		pkt_len = rte_pktmbuf_data_len(m);
 		ip_offset = sizeof(struct rte_ether_hdr);
@@ -449,7 +551,65 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 				key.src_ip = rte_be_to_cpu_32(ip->src_addr);
 				key.dst_ip = rte_be_to_cpu_32(ip->dst_addr);
 				key.proto = ip->next_proto_id;
-				session_track(&session_table, &key, rte_pktmbuf_pkt_len(m), rte_rdtsc(), NULL);
+				struct session_table *st = session_table_for_lcore(rte_lcore_id());
+				if (st) {
+					session_track(st, &key, rte_pktmbuf_pkt_len(m), rte_rdtsc(), NULL);
+				}
+			}
+
+			if (routing_on) {
+				uint32_t dst_ip = rte_be_to_cpu_32(ip->dst_addr);
+				for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+					if (ifcfgs[p].configured && ifcfgs[p].ip == dst_ip) {
+						rte_pktmbuf_free(m);
+						port_statistics[portid].dropped++;
+						return;
+					}
+				}
+				if (ip->time_to_live <= 1) {
+					rte_pktmbuf_free(m);
+					port_statistics[portid].dropped++;
+					return;
+				}
+				ip->time_to_live--;
+				ip->hdr_checksum = 0;
+				ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+				struct route_entry re;
+				if (!ipv4_rt || route_lookup(ipv4_rt, dst_ip, &re) != 0) {
+					rte_pktmbuf_free(m);
+					port_statistics[portid].dropped++;
+					return;
+				}
+				dst_port = re.out_port;
+				uint32_t next_ip = re.next_hop_ip ? re.next_hop_ip : dst_ip;
+				struct rte_ether_addr nh_mac;
+				if (arp_tbl && arp_lookup(arp_tbl, next_ip, &nh_mac) == 0) {
+					rte_ether_addr_copy(&nh_mac, &eth->dst_addr);
+					rte_ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->src_addr);
+
+					buffer = tx_buffer[dst_port];
+					sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
+					if (sent)
+						port_statistics[dst_port].tx += sent;
+					return;
+				}
+
+				if (arp_tbl && ifcfgs[dst_port].configured && arp_should_request(arp_tbl, next_ip)) {
+					uint64_t now = rte_get_timer_cycles();
+					arp_mark_requested(arp_tbl, next_ip, now);
+					struct rte_mbuf *req = arp_build_request(l2fwd_pktmbuf_pool,
+						&l2fwd_ports_eth_addr[dst_port], ifcfgs[dst_port].ip, next_ip);
+					if (req) {
+						buffer = tx_buffer[dst_port];
+						sent = rte_eth_tx_buffer(dst_port, 0, buffer, req);
+						if (sent)
+							port_statistics[dst_port].tx += sent;
+					}
+				}
+				rte_pktmbuf_free(m);
+				port_statistics[portid].dropped++;
+				return;
 			}
 		}
 	}
@@ -533,6 +693,9 @@ l2fwd_main_loop(void)
  
 					/* do this only on main core */
 					if (lcore_id == rte_get_main_lcore()) {
+						uint64_t now = rte_get_timer_cycles();
+						session_expire_all(now);
+						session_shared_sync(now);
 						print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
@@ -586,6 +749,9 @@ l2fwd_usage(const char *prgname)
 	       "      When enabled:\n"
 	       "       - The source MAC address is replaced by the TX port MAC address\n"
 	       "       - The destination MAC address is replaced by 02:00:00:00:00:TX_PORT_ID\n"
+	       "  --ifcfg PORT,IP/CIDR: Configure IPv4 address on port (enables routing mode)\n"
+	       "  --route DST/CIDR,NEXTHOP,PORT: Add IPv4 route (NEXTHOP can be 0.0.0.0 for direct)\n"
+	       "  --session-timeout-sec SEC: Expire sessions after SEC seconds (0 disables)\n"
 	       "  --portmap: Configure forwarding port pair mapping\n"
 	       "	      Default: alternate port pairs\n\n",
 	       prgname);
@@ -678,6 +844,127 @@ l2fwd_parse_nqueue(const char *q_arg)
 	return n;
 }
  
+static int parse_ipv4_addr(const char *s, uint32_t *ip_out) {
+	struct in_addr a;
+	if (!s || !ip_out) {
+		return -1;
+	}
+	if (inet_pton(AF_INET, s, &a) != 1) {
+		return -1;
+	}
+	*ip_out = rte_be_to_cpu_32(a.s_addr);
+	return 0;
+}
+
+static int parse_ipv4_cidr(const char *s, uint32_t *ip_out, uint8_t *depth_out) {
+	if (!s || !ip_out || !depth_out) {
+		return -1;
+	}
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *slash = strchr(buf, '/');
+	if (!slash) {
+		return -1;
+	}
+	*slash = '\0';
+	char *depth_str = slash + 1;
+	unsigned long depth = strtoul(depth_str, NULL, 10);
+	if (depth > 32) {
+		return -1;
+	}
+	uint32_t ip = 0;
+	if (parse_ipv4_addr(buf, &ip) != 0) {
+		return -1;
+	}
+	*ip_out = ip;
+	*depth_out = (uint8_t)depth;
+	return 0;
+}
+
+static uint32_t cidr_depth_to_mask(uint8_t depth) {
+	if (depth == 0) {
+		return 0;
+	}
+	return 0xFFFFFFFFu << (32 - depth);
+}
+
+static int parse_ifcfg_arg(const char *s) {
+	if (!s) {
+		return -1;
+	}
+	char buf[128];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *comma = strchr(buf, ',');
+	if (!comma) {
+		return -1;
+	}
+	*comma = '\0';
+	const char *port_str = buf;
+	const char *cidr_str = comma + 1;
+	unsigned long port = strtoul(port_str, NULL, 10);
+	if (port >= RTE_MAX_ETHPORTS) {
+		return -1;
+	}
+	uint32_t ip = 0;
+	uint8_t depth = 0;
+	if (parse_ipv4_cidr(cidr_str, &ip, &depth) != 0) {
+		return -1;
+	}
+	ifcfgs[port].ip = ip;
+	ifcfgs[port].mask = cidr_depth_to_mask(depth);
+	ifcfgs[port].configured = 1;
+	routing_on = 1;
+	return 0;
+}
+
+static int parse_route_arg(const char *s) {
+	if (!s) {
+		return -1;
+	}
+	if (pending_route_count >= MAX_PENDING_ROUTES) {
+		return -1;
+	}
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *c1 = strchr(buf, ',');
+	if (!c1) {
+		return -1;
+	}
+	*c1 = '\0';
+	char *c2 = strchr(c1 + 1, ',');
+	if (!c2) {
+		return -1;
+	}
+	*c2 = '\0';
+	const char *dst_cidr = buf;
+	const char *nh_str = c1 + 1;
+	const char *port_str = c2 + 1;
+
+	uint32_t dst_ip = 0;
+	uint8_t depth = 0;
+	if (parse_ipv4_cidr(dst_cidr, &dst_ip, &depth) != 0) {
+		return -1;
+	}
+	uint32_t nh = 0;
+	if (strcmp(nh_str, "0.0.0.0") != 0) {
+		if (parse_ipv4_addr(nh_str, &nh) != 0) {
+			return -1;
+		}
+	}
+	unsigned long port = strtoul(port_str, NULL, 10);
+	if (port >= RTE_MAX_ETHPORTS) {
+		return -1;
+	}
+
+	pending_routes[pending_route_count].dst_ip = dst_ip;
+	pending_routes[pending_route_count].depth = depth;
+	pending_routes[pending_route_count].next_hop_ip = nh;
+	pending_routes[pending_route_count].out_port = (uint16_t)port;
+	pending_route_count++;
+	routing_on = 1;
+	return 0;
+}
+
 static int
 l2fwd_parse_timer_period(const char *q_arg)
 {
@@ -703,6 +990,9 @@ static const char short_options[] =
  
 #define CMD_LINE_OPT_NO_MAC_UPDATING "no-mac-updating"
 #define CMD_LINE_OPT_PORTMAP_CONFIG "portmap"
+#define CMD_LINE_OPT_IFCFG "ifcfg"
+#define CMD_LINE_OPT_ROUTE "route"
+#define CMD_LINE_OPT_SESSION_TIMEOUT "session-timeout-sec"
  
 enum {
 	/* long options mapped to a short option */
@@ -711,12 +1001,18 @@ enum {
 	 * conflict with short options */
 	CMD_LINE_OPT_NO_MAC_UPDATING_NUM = 256,
 	CMD_LINE_OPT_PORTMAP_NUM,
+	CMD_LINE_OPT_IFCFG_NUM,
+	CMD_LINE_OPT_ROUTE_NUM,
+	CMD_LINE_OPT_SESSION_TIMEOUT_NUM,
 };
  
 static const struct option lgopts[] = {
 	{ CMD_LINE_OPT_NO_MAC_UPDATING, no_argument, 0,
 		CMD_LINE_OPT_NO_MAC_UPDATING_NUM},
 	{ CMD_LINE_OPT_PORTMAP_CONFIG, 1, 0, CMD_LINE_OPT_PORTMAP_NUM},
+	{ CMD_LINE_OPT_IFCFG, 1, 0, CMD_LINE_OPT_IFCFG_NUM},
+	{ CMD_LINE_OPT_ROUTE, 1, 0, CMD_LINE_OPT_ROUTE_NUM},
+	{ CMD_LINE_OPT_SESSION_TIMEOUT, 1, 0, CMD_LINE_OPT_SESSION_TIMEOUT_NUM},
 	{NULL, 0, 0, 0}
 };
  
@@ -784,6 +1080,34 @@ l2fwd_parse_args(int argc, char **argv)
 			mac_updating = 0;
 			break;
  
+		case CMD_LINE_OPT_IFCFG_NUM:
+			if (parse_ifcfg_arg(optarg) != 0) {
+				fprintf(stderr, "Invalid ifcfg\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
+
+		case CMD_LINE_OPT_ROUTE_NUM:
+			if (parse_route_arg(optarg) != 0) {
+				fprintf(stderr, "Invalid route\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
+
+		case CMD_LINE_OPT_SESSION_TIMEOUT_NUM: {
+			char *endp = NULL;
+			long v = strtol(optarg, &endp, 10);
+			if (!optarg[0] || (endp && *endp) || v < 0) {
+				fprintf(stderr, "Invalid session timeout\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			session_timeout_tsc = (uint64_t)v * rte_get_timer_hz();
+			break;
+		}
+
 		default:
 			l2fwd_usage(prgname);
 			return -1;
@@ -946,8 +1270,13 @@ main(int argc, char **argv)
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid L2FWD arguments\n");
 	/* >8 End of init EAL. */
+
+	if (routing_on)
+		mac_updating = 0;
  
 	printf("MAC updating %s\n", mac_updating ? "enabled" : "disabled");
+	if (routing_on)
+		printf("IPv4 routing mode enabled\n");
  
 	/* convert to number of cycles */
 	timer_period *= rte_get_timer_hz();
@@ -1046,12 +1375,40 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 	/* >8 End of create the mbuf pool. */
 
+	if (routing_on) {
+		arp_tbl = arp_table_create("arp_cache", rte_socket_id(), 2048, 300, 500);
+		if (!arp_tbl)
+			rte_exit(EXIT_FAILURE, "Cannot init ARP table\n");
+		ipv4_rt = route_table_create("ipv4_rt", rte_socket_id(), 2048);
+		if (!ipv4_rt)
+			rte_exit(EXIT_FAILURE, "Cannot init IPv4 route table\n");
+
+		for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+			if (!ifcfgs[p].configured)
+				continue;
+			uint32_t depth = (uint32_t)__builtin_popcount(ifcfgs[p].mask);
+			uint32_t net = ifcfgs[p].ip & ifcfgs[p].mask;
+			route_add(ipv4_rt, net, (uint8_t)depth, 0, p);
+		}
+		for (uint32_t i = 0; i < pending_route_count; i++) {
+			route_add(ipv4_rt, pending_routes[i].dst_ip, pending_routes[i].depth,
+				pending_routes[i].next_hop_ip, pending_routes[i].out_port);
+		}
+	}
+
 	if (acl_runtime_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init ACL runtime\n");
 	if (acl_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init ACL IPC\n");
-	if (session_table_init(&session_table, "session_table", 65536, rte_socket_id()) != 0)
-		rte_exit(EXIT_FAILURE, "Cannot init session table\n");
+	RTE_LCORE_FOREACH(lcore_id) {
+		char name[64];
+		snprintf(name, sizeof(name), "session_table_%u", lcore_id);
+		if (session_table_init(&session_tables[lcore_id], name, 65536, rte_socket_id()) != 0)
+			rte_exit(EXIT_FAILURE, "Cannot init session table for lcore %u\n", lcore_id);
+		session_table_inited[lcore_id] = 1;
+	}
+	if (session_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init session IPC\n");
 	if (pthread_create(&acl_ctrl_thread, NULL, acl_ctrl_thread_main, NULL) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot start ACL control thread\n");
  
@@ -1207,7 +1564,14 @@ main(int argc, char **argv)
 	force_quit = true;
 	pthread_join(acl_ctrl_thread, NULL);
 	acl_runtime_free();
-	session_table_free(&session_table);
+	arp_table_free(arp_tbl);
+	route_table_free(ipv4_rt);
+	RTE_LCORE_FOREACH(lcore_id) {
+		if (session_table_inited[lcore_id]) {
+			session_table_free(&session_tables[lcore_id]);
+			session_table_inited[lcore_id] = 0;
+		}
+	}
 	rte_eal_cleanup();
 	printf("Bye...\n");
  

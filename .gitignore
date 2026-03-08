@@ -1,2 +1,9 @@
 # 忽略项目根目录下的build目录中所有文件和子目录
 /build/
+/.cache/
+/.trae/
+/web/frontend/node_modules/
+/web/frontend/dist/
+/web/backend/*.db
+/web/backend/*.db-shm
+/web/backend/*.db-wal

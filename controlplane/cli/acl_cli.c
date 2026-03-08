@@ -26,11 +26,13 @@
 
 #include "acl/acl.h"
 #include "ipc/acl_ipc.h"
+#include "ipc/session_ipc.h"
 
 static volatile sig_atomic_t force_quit;
 static struct rte_ring *acl_cmd_ring;
 static struct rte_ring *acl_resp_ring;
 static struct acl_shared_cfg *acl_shared_cfg;
+static struct session_shared_cfg *session_shared_cfg;
 static const char *cli_host = "0.0.0.0";
 static uint16_t cli_port = 8086;
 static uint32_t cmd_seq;
@@ -80,6 +82,12 @@ struct cmd_acl_quit_result {
 	cmdline_fixed_string_t quit;
 };
 
+struct cmd_session_list_result {
+	cmdline_fixed_string_t session;
+	cmdline_fixed_string_t list;
+	uint32_t limit;
+};
+
 static int parse_ipaddr_v4(const cmdline_ipaddr_t *in, uint32_t *ip, uint32_t *mask) {
 	if (in->family != AF_INET) {
 		return -EINVAL;
@@ -106,6 +114,12 @@ static void print_ip_mask(char *out, size_t len, uint32_t ip, uint32_t mask) {
 	inet_ntop(AF_INET, &addr, ipbuf, sizeof(ipbuf));
 	inet_ntop(AF_INET, &m, maskbuf, sizeof(maskbuf));
 	snprintf(out, len, "%s/%s", ipbuf, maskbuf);
+}
+
+static void print_ipv4(char *out, size_t len, uint32_t ip) {
+	struct in_addr addr;
+	addr.s_addr = rte_cpu_to_be_32(ip);
+	inet_ntop(AF_INET, &addr, out, len);
 }
 
 static int wait_resp(uint32_t seq, struct acl_cmd_resp **resp_out) {
@@ -322,6 +336,45 @@ static void cmd_acl_quit_parsed(void *parsed_result, struct cmdline *cl, void *d
 	cmdline_quit(cl);
 }
 
+static void cmd_session_list_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)data;
+	struct cmd_session_list_result *res = parsed_result;
+	uint32_t limit = res->limit;
+	if (limit == 0 || limit > SESSION_MAX_EXPORT) {
+		limit = SESSION_MAX_EXPORT;
+	}
+	if (!session_shared_cfg) {
+		cmdline_printf(cl, "SESSIONS: 0 (version 0)\n");
+		return;
+	}
+	uint64_t v1 = rte_atomic64_read(&session_shared_cfg->version);
+	uint32_t count = session_shared_cfg->count;
+	if (count > limit) {
+		count = limit;
+	}
+	uint64_t now = rte_get_timer_cycles();
+	uint64_t hz = rte_get_timer_hz();
+	uint64_t v2 = rte_atomic64_read(&session_shared_cfg->version);
+	if (v1 != v2) {
+		v1 = v2;
+	}
+	cmdline_printf(cl, "SESSIONS: %u (version %" PRIu64 ")\n", count, v1);
+	for (uint32_t i = 0; i < count; i++) {
+		const struct session_key *k = &session_shared_cfg->keys[i];
+		const struct session_entry *e = &session_shared_cfg->entries[i];
+		char srcip[INET_ADDRSTRLEN];
+		char dstip[INET_ADDRSTRLEN];
+		print_ipv4(srcip, sizeof(srcip), k->src_ip);
+		print_ipv4(dstip, sizeof(dstip), k->dst_ip);
+		uint64_t last_ms = 0;
+		if (e->last_seen_tsc && hz) {
+			last_ms = (now - e->last_seen_tsc) * 1000ULL / hz;
+		}
+		cmdline_printf(cl, "%u proto=%u src=%s:%u dst=%s:%u packets=%" PRIu64 " bytes=%" PRIu64 " last_seen_ms=%" PRIu64 "\n",
+			i, k->proto, srcip, k->src_port, dstip, k->dst_port, e->packets, e->bytes, last_ms);
+	}
+}
+
 cmdline_parse_token_string_t cmd_acl_add_acl =
 	TOKEN_STRING_INITIALIZER(struct cmd_acl_add_result, acl, "acl");
 cmdline_parse_token_string_t cmd_acl_add_add =
@@ -426,11 +479,31 @@ cmdline_parse_inst_t cmd_acl_quit = {
 	},
 };
 
+cmdline_parse_token_string_t cmd_session_list_session =
+	TOKEN_STRING_INITIALIZER(struct cmd_session_list_result, session, "session");
+cmdline_parse_token_string_t cmd_session_list_list =
+	TOKEN_STRING_INITIALIZER(struct cmd_session_list_result, list, "list");
+cmdline_parse_token_num_t cmd_session_list_limit =
+	TOKEN_NUM_INITIALIZER(struct cmd_session_list_result, limit, RTE_UINT32);
+
+cmdline_parse_inst_t cmd_session_list = {
+	.f = cmd_session_list_parsed,
+	.data = NULL,
+	.help_str = "session list <limit>",
+	.tokens = {
+		(void *)&cmd_session_list_session,
+		(void *)&cmd_session_list_list,
+		(void *)&cmd_session_list_limit,
+		NULL,
+	},
+};
+
 cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_acl_add,
 	(cmdline_parse_inst_t *)&cmd_acl_del,
 	(cmdline_parse_inst_t *)&cmd_acl_clear,
 	(cmdline_parse_inst_t *)&cmd_acl_list,
+	(cmdline_parse_inst_t *)&cmd_session_list,
 	(cmdline_parse_inst_t *)&cmd_acl_quit,
 	NULL,
 };
@@ -539,6 +612,10 @@ int main(int argc, char **argv) {
 	}
 
 	acl_shared_cfg = (struct acl_shared_cfg *)mz->addr;
+	const struct rte_memzone *smz = rte_memzone_lookup(SESSION_SHARED_NAME);
+	if (smz) {
+		session_shared_cfg = (struct session_shared_cfg *)smz->addr;
+	}
 
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);

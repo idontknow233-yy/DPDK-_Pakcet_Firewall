@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <rte_spinlock.h>
+
 struct rte_hash;
 
 struct session_key {
@@ -24,10 +26,14 @@ struct session_table {
 	struct rte_hash *hash;
 	struct session_entry *entries;
 	uint32_t capacity;
+	rte_spinlock_t lock;
 };
 
 int session_table_init(struct session_table *table, const char *name, uint32_t capacity, int socket_id);
 void session_table_free(struct session_table *table);
 int session_track(struct session_table *table, const struct session_key *key, uint32_t pkt_len, uint64_t now_tsc, bool *is_new);
+uint32_t session_soft_expire(struct session_table *table, uint64_t now_tsc, uint64_t timeout_tsc);
+uint32_t session_export(struct session_table *table, struct session_key *keys, struct session_entry *entries, uint32_t max_entries,
+	uint64_t now_tsc, uint64_t timeout_tsc);
 
 #endif

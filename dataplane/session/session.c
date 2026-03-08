@@ -35,6 +35,7 @@ int session_table_init(struct session_table *table, const char *name, uint32_t c
 	}
 
 	table->capacity = capacity;
+	rte_spinlock_init(&table->lock);
 	return 0;
 }
 
@@ -58,10 +59,12 @@ int session_track(struct session_table *table, const struct session_key *key, ui
 		return -EINVAL;
 	}
 
+	rte_spinlock_lock(&table->lock);
 	int32_t pos = rte_hash_lookup(table->hash, key);
 	if (pos < 0) {
 		pos = rte_hash_add_key(table->hash, key);
 		if (pos < 0) {
+			rte_spinlock_unlock(&table->lock);
 			return -ENOENT;
 		}
 		if (is_new) {
@@ -70,6 +73,7 @@ int session_track(struct session_table *table, const struct session_key *key, ui
 		table->entries[pos].last_seen_tsc = now_tsc;
 		table->entries[pos].packets = 1;
 		table->entries[pos].bytes = pkt_len;
+		rte_spinlock_unlock(&table->lock);
 		return 0;
 	}
 
@@ -79,5 +83,78 @@ int session_track(struct session_table *table, const struct session_key *key, ui
 	table->entries[pos].last_seen_tsc = now_tsc;
 	table->entries[pos].packets += 1;
 	table->entries[pos].bytes += pkt_len;
+	rte_spinlock_unlock(&table->lock);
 	return 0;
+}
+
+uint32_t session_soft_expire(struct session_table *table, uint64_t now_tsc, uint64_t timeout_tsc) {
+	if (!table || !table->hash || !table->entries) {
+		return 0;
+	}
+	if (timeout_tsc == 0) {
+		return 0;
+	}
+	uint32_t expired = 0;
+	uint32_t next = 0;
+	const void *key = NULL;
+	void *data = NULL;
+	rte_spinlock_lock(&table->lock);
+	for (;;) {
+		int32_t pos = rte_hash_iterate(table->hash, &key, &data, &next);
+		if (pos == -ENOENT) {
+			break;
+		}
+		if (pos < 0) {
+			break;
+		}
+		struct session_entry *e = &table->entries[pos];
+		if (e->last_seen_tsc == 0) {
+			continue;
+		}
+		if (now_tsc - e->last_seen_tsc > timeout_tsc) {
+			rte_hash_del_key(table->hash, key);
+			e->last_seen_tsc = 0;
+			e->packets = 0;
+			e->bytes = 0;
+			expired++;
+		}
+	}
+	rte_spinlock_unlock(&table->lock);
+	return expired;
+}
+
+uint32_t session_export(struct session_table *table, struct session_key *keys, struct session_entry *entries, uint32_t max_entries,
+	uint64_t now_tsc, uint64_t timeout_tsc) {
+	if (!table || !table->hash || !table->entries || !keys || !entries || max_entries == 0) {
+		return 0;
+	}
+	uint32_t next = 0;
+	const void *key = NULL;
+	void *data = NULL;
+	uint32_t out = 0;
+	rte_spinlock_lock(&table->lock);
+	for (;;) {
+		int32_t pos = rte_hash_iterate(table->hash, &key, &data, &next);
+		if (pos == -ENOENT) {
+			break;
+		}
+		if (pos < 0) {
+			break;
+		}
+		const struct session_entry *e = &table->entries[pos];
+		if (e->last_seen_tsc == 0) {
+			continue;
+		}
+		if (timeout_tsc && (now_tsc - e->last_seen_tsc > timeout_tsc)) {
+			continue;
+		}
+		if (out >= max_entries) {
+			break;
+		}
+		keys[out] = *(const struct session_key *)key;
+		entries[out] = *e;
+		out++;
+	}
+	rte_spinlock_unlock(&table->lock);
+	return out;
 }
