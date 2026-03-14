@@ -18,9 +18,15 @@ func (f *fakeCLIRunner) Run(cmd string) ([]string, error) {
 	if cmd == "acl list" {
 		return f.renderList(), nil
 	}
+	if cmd == "acl6 list" {
+		return []string{"ACL6 rules: 0 (version 1)"}, nil
+	}
 	if cmd == "acl clear" {
 		f.rules = nil
 		return []string{"ACL cleared"}, nil
+	}
+	if cmd == "acl6 clear" {
+		return []string{"ACL6 cleared"}, nil
 	}
 	if strings.HasPrefix(cmd, "acl del ") {
 		idx, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(cmd, "acl del ")))
@@ -30,6 +36,9 @@ func (f *fakeCLIRunner) Run(cmd string) ([]string, error) {
 		f.rules = append(f.rules[:idx], f.rules[idx+1:]...)
 		return []string{"ACL rule deleted"}, nil
 	}
+	if strings.HasPrefix(cmd, "acl6 del ") {
+		return []string{"ACL6 rule deleted"}, nil
+	}
 	if strings.HasPrefix(cmd, "acl add ") {
 		r, err := parseAddCommand(cmd)
 		if err != nil {
@@ -37,6 +46,9 @@ func (f *fakeCLIRunner) Run(cmd string) ([]string, error) {
 		}
 		f.rules = append(f.rules, r)
 		return []string{"ACL rule added"}, nil
+	}
+	if strings.HasPrefix(cmd, "acl6 add ") {
+		return []string{"ACL6 rule added"}, nil
 	}
 	return []string{"unknown"}, nil
 }

@@ -44,17 +44,28 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 #include <rte_ip.h>
+#include <rte_ip6.h>
 #include <rte_ring.h>
 #include <rte_memzone.h>
 #include <rte_atomic.h>
 #include <rte_hash.h>
+#include <rte_jhash.h>
 
 #include "acl/acl.h"
+#include "acl/acl6.h"
 #include "arp/arp.h"
 #include "ipc/acl_ipc.h"
+#include "ipc/acl6_ipc.h"
 #include "ipc/session_ipc.h"
+#include "ipc/session6_ipc.h"
+#include "ipc/stats_ipc.h"
+#include "ipc/rlim_ipc.h"
+#include "ipc/route6_ipc.h"
+#include "nd/nd.h"
 #include "route/route.h"
+#include "route/route6.h"
 #include "session/session.h"
+#include "session/session6.h"
  
 static volatile bool force_quit;
  
@@ -120,7 +131,10 @@ struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 
 static struct session_table session_tables[RTE_MAX_LCORE];
 static uint8_t session_table_inited[RTE_MAX_LCORE];
+static struct session6_table session6_tables[RTE_MAX_LCORE];
+static uint8_t session6_table_inited[RTE_MAX_LCORE];
 static pthread_t acl_ctrl_thread;
+static pthread_t acl6_ctrl_thread;
 
 struct acl_runtime {
 	struct acl_ctx ctx[2];
@@ -129,22 +143,159 @@ struct acl_runtime {
 };
 
 static struct acl_runtime acl_rt;
+
+struct acl6_runtime {
+	struct acl6_ctx ctx[2];
+	rte_atomic32_t active;
+	rte_atomic64_t version;
+};
+
+static struct acl6_runtime acl6_rt;
 static struct rte_ring *acl_cmd_ring;
 static struct rte_ring *acl_resp_ring;
 static struct acl_shared_cfg *acl_shared_cfg;
+static struct rte_ring *acl6_cmd_ring;
+static struct rte_ring *acl6_resp_ring;
+static struct acl6_shared_cfg *acl6_shared_cfg;
 static struct session_shared_cfg *session_shared_cfg;
+static struct session6_shared_cfg *session6_shared_cfg;
+static struct portstats_shared_cfg *portstats_shared_cfg;
+static struct denylog_shared_cfg *denylog_shared_cfg;
+static struct denylog6_shared_cfg *denylog6_shared_cfg;
+static struct rlim_shared_cfg *rlim_shared_cfg;
+static struct route6_shared_cfg *route6_shared_cfg;
 static uint64_t session_timeout_tsc;
 
 static struct route_table *ipv4_rt;
 static struct arp_table *arp_tbl;
 static struct arp_ifcfg ifcfgs[RTE_MAX_ETHPORTS];
+static struct nd_table *nd_tbl;
+static struct route6_table *ipv6_rt_tbls[2];
+static rte_atomic32_t ipv6_rt_active_idx;
+static struct route6_table *ipv6_rt_reclaim;
+static struct nd_ifcfg ifcfg6_tbls[2][RTE_MAX_ETHPORTS];
+static rte_atomic32_t ifcfg6_active_idx;
 static int routing_on;
+
+static inline struct route6_table *ipv6_rt_active(void) {
+	uint32_t idx = rte_atomic32_read(&ipv6_rt_active_idx) & 1u;
+	return ipv6_rt_tbls[idx];
+}
+
+static inline struct nd_ifcfg *ifcfg6_active(void) {
+	uint32_t idx = rte_atomic32_read(&ifcfg6_active_idx) & 1u;
+	return ifcfg6_tbls[idx];
+}
+
+struct rlim_bucket {
+	uint64_t tokens;
+	uint64_t last_tsc;
+};
+
+struct rlim_table {
+	struct rte_hash *h;
+	struct rlim_bucket *buckets;
+	uint32_t cap;
+	uint32_t key_len;
+};
+
+static struct rlim_table rlim_syn_tbls[RTE_MAX_LCORE];
+static struct rlim_table rlim_udp_tbls[RTE_MAX_LCORE];
+static struct rlim_table rlim6_syn_tbls[RTE_MAX_LCORE];
+static struct rlim_table rlim6_udp_tbls[RTE_MAX_LCORE];
+static uint8_t rlim_inited[RTE_MAX_LCORE];
+static uint32_t rlim_syn_pps;
+static uint32_t rlim_syn_burst;
+static uint32_t rlim_udp_pps;
+static uint32_t rlim_udp_burst;
+
+static int rlim_table_init(struct rlim_table *t, const char *name, uint32_t cap, uint32_t key_len, int socket_id) {
+	if (!t || !name || cap == 0 || key_len == 0) {
+		return -1;
+	}
+	memset(t, 0, sizeof(*t));
+	t->cap = cap;
+	t->key_len = key_len;
+	t->buckets = rte_zmalloc_socket(NULL, sizeof(struct rlim_bucket) * cap, 0, socket_id);
+	if (!t->buckets) {
+		return -1;
+	}
+	struct rte_hash_parameters hp;
+	memset(&hp, 0, sizeof(hp));
+	hp.name = name;
+	hp.entries = cap;
+	hp.key_len = key_len;
+	hp.hash_func = rte_jhash;
+	hp.hash_func_init_val = 0;
+	hp.socket_id = socket_id;
+	t->h = rte_hash_create(&hp);
+	if (!t->h) {
+		rte_free(t->buckets);
+		memset(t, 0, sizeof(*t));
+		return -1;
+	}
+	return 0;
+}
+
+static void rlim_table_free(struct rlim_table *t) {
+	if (!t) {
+		return;
+	}
+	if (t->h) {
+		rte_hash_free(t->h);
+	}
+	if (t->buckets) {
+		rte_free(t->buckets);
+	}
+	memset(t, 0, sizeof(*t));
+}
+
+static inline int rlim_allow(struct rlim_table *t, const void *key, uint64_t now_tsc, uint64_t hz, uint32_t pps, uint32_t burst) {
+	if (!t || !t->h || !t->buckets || pps == 0 || burst == 0 || hz == 0) {
+		return 1;
+	}
+	if (!key) {
+		return 1;
+	}
+	int32_t pos = rte_hash_lookup(t->h, key);
+	if (pos < 0) {
+		pos = rte_hash_add_key(t->h, key);
+		if (pos < 0) {
+			return 0;
+		}
+		struct rlim_bucket *b = &t->buckets[(uint32_t)pos];
+		b->tokens = burst;
+		b->last_tsc = now_tsc;
+	}
+	struct rlim_bucket *b = &t->buckets[(uint32_t)pos];
+	if (now_tsc > b->last_tsc) {
+		uint64_t delta = now_tsc - b->last_tsc;
+		uint64_t add = (delta * (uint64_t)pps) / hz;
+		if (add) {
+			uint64_t nt = b->tokens + add;
+			b->tokens = nt > burst ? burst : nt;
+			b->last_tsc = now_tsc;
+		}
+	}
+	if (b->tokens == 0) {
+		return 0;
+	}
+	b->tokens--;
+	return 1;
+}
 
 static struct session_table *session_table_for_lcore(unsigned lcore_id) {
 	if (lcore_id >= RTE_MAX_LCORE || !session_table_inited[lcore_id]) {
 		return NULL;
 	}
 	return &session_tables[lcore_id];
+}
+
+static struct session6_table *session6_table_for_lcore(unsigned lcore_id) {
+	if (lcore_id >= RTE_MAX_LCORE || !session6_table_inited[lcore_id]) {
+		return NULL;
+	}
+	return &session6_tables[lcore_id];
 }
 
 /* Per-port statistics struct */
@@ -154,6 +305,50 @@ struct __rte_cache_aligned l2fwd_port_statistics {
 	uint64_t dropped;
 };
 struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
+
+static int portstats_shared_sync(void) {
+	if (!portstats_shared_cfg) {
+		return -1;
+	}
+	portstats_shared_cfg->enabled_port_mask = l2fwd_enabled_port_mask;
+	for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+		portstats_shared_cfg->ports[p].rx = port_statistics[p].rx;
+		portstats_shared_cfg->ports[p].tx = port_statistics[p].tx;
+		portstats_shared_cfg->ports[p].dropped = port_statistics[p].dropped;
+	}
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&portstats_shared_cfg->version);
+	rte_atomic64_set(&portstats_shared_cfg->version, v + 1);
+	return 0;
+}
+
+static void send_gratuitous_arp(void) {
+	for (uint16_t portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
+			continue;
+		if (!ifcfgs[portid].configured)
+			continue;
+		if (!arp_tbl)
+			continue;
+
+		struct rte_mbuf *m = arp_build_request(
+			l2fwd_pktmbuf_pool,
+			&l2fwd_ports_eth_addr[portid],
+			ifcfgs[portid].ip,
+			ifcfgs[portid].ip
+		);
+		if (!m)
+			continue;
+
+		struct rte_eth_dev_tx_buffer *buffer = tx_buffer[portid];
+		int sent = rte_eth_tx_buffer(portid, 0, buffer, m);
+		if (sent)
+			port_statistics[portid].tx += (uint64_t)sent;
+		sent = rte_eth_tx_buffer_flush(portid, 0, buffer);
+		if (sent)
+			port_statistics[portid].tx += (uint64_t)sent;
+	}
+}
  
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
 /* A tsc-based timer responsible for triggering statistics printout */
@@ -166,9 +361,19 @@ struct pending_route {
 	uint16_t out_port;
 };
 
+struct pending_route6 {
+	struct rte_ipv6_addr dst_ip;
+	uint8_t depth;
+	struct rte_ipv6_addr next_hop_ip;
+	uint16_t out_port;
+	uint16_t reserved;
+};
+
 #define MAX_PENDING_ROUTES 1024
 static struct pending_route pending_routes[MAX_PENDING_ROUTES];
 static uint32_t pending_route_count;
+static struct pending_route6 pending_routes6[MAX_PENDING_ROUTES];
+static uint32_t pending_route6_count;
  
 static int acl_seed_default_rules(struct acl_ctx *ctx) {
 	struct acl_rule deny_private = {
@@ -206,9 +411,25 @@ static int acl_seed_default_rules(struct acl_ctx *ctx) {
 	return 0;
 }
 
+static int acl6_seed_default_rules(struct acl6_ctx *ctx) {
+	struct acl6_rule allow_all;
+	memset(&allow_all, 0, sizeof(allow_all));
+	allow_all.src_depth = 0;
+	allow_all.dst_depth = 0;
+	allow_all.match_ports = 0;
+	allow_all.proto = 0;
+	allow_all.allow = 1;
+	return acl6_add_rule(ctx, &allow_all);
+}
+
 static inline struct acl_ctx *acl_runtime_active_ctx(void) {
 	uint32_t idx = rte_atomic32_read(&acl_rt.active) & 1u;
 	return &acl_rt.ctx[idx];
+}
+
+static inline struct acl6_ctx *acl6_runtime_active_ctx(void) {
+	uint32_t idx = rte_atomic32_read(&acl6_rt.active) & 1u;
+	return &acl6_rt.ctx[idx];
 }
 
 static int acl_shared_sync(const struct acl_ctx *ctx, uint64_t version) {
@@ -248,6 +469,43 @@ static int acl_ipc_init(void) {
 	return acl_shared_sync(acl_runtime_active_ctx(), rte_atomic64_read(&acl_rt.version));
 }
 
+static int acl6_shared_sync(const struct acl6_ctx *ctx, uint64_t version) {
+	if (!acl6_shared_cfg || !ctx) {
+		return -1;
+	}
+	rte_rwlock_read_lock((rte_rwlock_t *)&ctx->lock);
+	uint32_t count = ctx->count;
+	if (count > ACL6_MAX_RULES) {
+		count = ACL6_MAX_RULES;
+	}
+	memcpy(acl6_shared_cfg->rules, ctx->rules, sizeof(struct acl6_rule) * count);
+	acl6_shared_cfg->count = count;
+	rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
+	rte_wmb();
+	rte_atomic64_set(&acl6_shared_cfg->version, version);
+	return 0;
+}
+
+static int acl6_ipc_init(void) {
+	acl6_cmd_ring = rte_ring_create(ACL6_CMD_RING_NAME, ACL6_CMD_RING_SIZE, rte_socket_id(), 0);
+	if (!acl6_cmd_ring) {
+		return -1;
+	}
+	acl6_resp_ring = rte_ring_create(ACL6_RESP_RING_NAME, ACL6_RESP_RING_SIZE, rte_socket_id(), 0);
+	if (!acl6_resp_ring) {
+		return -1;
+	}
+	const struct rte_memzone *mz = rte_memzone_reserve(ACL6_SHARED_CFG_NAME, sizeof(struct acl6_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	acl6_shared_cfg = mz->addr;
+	memset(acl6_shared_cfg, 0, sizeof(*acl6_shared_cfg));
+	rte_atomic64_init(&acl6_shared_cfg->version);
+	return acl6_shared_sync(acl6_runtime_active_ctx(), rte_atomic64_read(&acl6_rt.version));
+}
+
 static int session_ipc_init(void) {
 	const struct rte_memzone *mz = rte_memzone_reserve(SESSION_SHARED_NAME, sizeof(struct session_shared_cfg),
 		rte_socket_id(), 0);
@@ -258,6 +516,194 @@ static int session_ipc_init(void) {
 	memset(session_shared_cfg, 0, sizeof(*session_shared_cfg));
 	rte_atomic64_init(&session_shared_cfg->version);
 	return 0;
+}
+
+static int session6_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(SESSION6_SHARED_NAME, sizeof(struct session6_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	session6_shared_cfg = mz->addr;
+	memset(session6_shared_cfg, 0, sizeof(*session6_shared_cfg));
+	rte_atomic64_init(&session6_shared_cfg->version);
+	return 0;
+}
+
+static int portstats_ipc_init(uint16_t nb_ports) {
+	const struct rte_memzone *mz = rte_memzone_reserve(PORTSTATS_SHARED_NAME, sizeof(struct portstats_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	portstats_shared_cfg = mz->addr;
+	memset(portstats_shared_cfg, 0, sizeof(*portstats_shared_cfg));
+	rte_atomic64_init(&portstats_shared_cfg->version);
+	portstats_shared_cfg->enabled_port_mask = l2fwd_enabled_port_mask;
+	portstats_shared_cfg->nb_ports = nb_ports;
+	portstats_shared_cfg->tsc_hz = rte_get_timer_hz();
+	return 0;
+}
+
+static int denylog_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(DENYLOG_SHARED_NAME, sizeof(struct denylog_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	denylog_shared_cfg = mz->addr;
+	memset(denylog_shared_cfg, 0, sizeof(*denylog_shared_cfg));
+	rte_atomic64_init(&denylog_shared_cfg->version);
+	rte_spinlock_init(&denylog_shared_cfg->lock);
+	denylog_shared_cfg->tsc_hz = rte_get_timer_hz();
+	return 0;
+}
+
+static int denylog6_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(DENYLOG6_SHARED_NAME, sizeof(struct denylog6_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	denylog6_shared_cfg = mz->addr;
+	memset(denylog6_shared_cfg, 0, sizeof(*denylog6_shared_cfg));
+	rte_atomic64_init(&denylog6_shared_cfg->version);
+	rte_spinlock_init(&denylog6_shared_cfg->lock);
+	denylog6_shared_cfg->tsc_hz = rte_get_timer_hz();
+	return 0;
+}
+
+static int route6_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(ROUTE6_SHARED_NAME, sizeof(struct route6_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	route6_shared_cfg = mz->addr;
+	memset(route6_shared_cfg, 0, sizeof(*route6_shared_cfg));
+	rte_atomic64_init(&route6_shared_cfg->version);
+	return 0;
+}
+
+static int rlim_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(RLIM_SHARED_NAME, sizeof(struct rlim_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	rlim_shared_cfg = mz->addr;
+	memset(rlim_shared_cfg, 0, sizeof(*rlim_shared_cfg));
+	rte_atomic64_init(&rlim_shared_cfg->version);
+	rlim_shared_cfg->syn_pps = rlim_syn_pps;
+	rlim_shared_cfg->syn_burst = rlim_syn_burst;
+	rlim_shared_cfg->udp_pps = rlim_udp_pps;
+	rlim_shared_cfg->udp_burst = rlim_udp_burst;
+	rte_wmb();
+	rte_atomic64_set(&rlim_shared_cfg->version, 1);
+	return 0;
+}
+
+static void rlim_apply_shared_cfg(void) {
+	if (!rlim_shared_cfg) {
+		return;
+	}
+	static uint64_t last_v;
+	uint64_t v1 = rte_atomic64_read(&rlim_shared_cfg->version);
+	if (v1 == 0 || v1 == last_v) {
+		return;
+	}
+	uint32_t syn_pps = rlim_shared_cfg->syn_pps;
+	uint32_t syn_burst = rlim_shared_cfg->syn_burst;
+	uint32_t udp_pps = rlim_shared_cfg->udp_pps;
+	uint32_t udp_burst = rlim_shared_cfg->udp_burst;
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&rlim_shared_cfg->version);
+	if (v2 != v1) {
+		return;
+	}
+	last_v = v2;
+	rlim_syn_pps = syn_pps;
+	rlim_syn_burst = syn_burst;
+	rlim_udp_pps = udp_pps;
+	rlim_udp_burst = udp_burst;
+	if (rlim_syn_pps == 0) {
+		rlim_syn_burst = 0;
+	}
+	if (rlim_udp_pps == 0) {
+		rlim_udp_burst = 0;
+	}
+	if ((rlim_syn_pps || rlim_udp_pps)) {
+		unsigned lcore_id;
+		RTE_LCORE_FOREACH(lcore_id) {
+			if (lcore_id >= RTE_MAX_LCORE || rlim_inited[lcore_id]) {
+				continue;
+			}
+			char name[64];
+			if (rlim_syn_pps) {
+				snprintf(name, sizeof(name), "rlim_syn_%u", lcore_id);
+				(void)rlim_table_init(&rlim_syn_tbls[lcore_id], name, 32768, sizeof(uint32_t), rte_socket_id());
+				snprintf(name, sizeof(name), "rlim6_syn_%u", lcore_id);
+				(void)rlim_table_init(&rlim6_syn_tbls[lcore_id], name, 32768, sizeof(struct rte_ipv6_addr), rte_socket_id());
+			}
+			if (rlim_udp_pps) {
+				snprintf(name, sizeof(name), "rlim_udp_%u", lcore_id);
+				(void)rlim_table_init(&rlim_udp_tbls[lcore_id], name, 32768, sizeof(uint32_t), rte_socket_id());
+				snprintf(name, sizeof(name), "rlim6_udp_%u", lcore_id);
+				(void)rlim_table_init(&rlim6_udp_tbls[lcore_id], name, 32768, sizeof(struct rte_ipv6_addr), rte_socket_id());
+			}
+			rlim_inited[lcore_id] = 1;
+		}
+	}
+}
+
+static void denylog_add(uint64_t tsc, uint16_t in_port, uint32_t src_ip, uint32_t dst_ip,
+	uint8_t proto, uint16_t src_port, uint16_t dst_port, uint32_t rule_index) {
+	if (!denylog_shared_cfg) {
+		return;
+	}
+	rte_spinlock_lock(&denylog_shared_cfg->lock);
+	uint32_t pos = denylog_shared_cfg->head;
+	struct denylog_entry *e = &denylog_shared_cfg->entries[pos];
+	e->tsc = tsc;
+	e->in_port = (uint8_t)in_port;
+	e->proto = proto;
+	e->src_ip = src_ip;
+	e->dst_ip = dst_ip;
+	e->src_port = src_port;
+	e->dst_port = dst_port;
+	e->rule_index = rule_index;
+	denylog_shared_cfg->head = (pos + 1) % DENYLOG_MAX;
+	if (denylog_shared_cfg->count < DENYLOG_MAX) {
+		denylog_shared_cfg->count++;
+	}
+	uint64_t v = rte_atomic64_read(&denylog_shared_cfg->version);
+	rte_atomic64_set(&denylog_shared_cfg->version, v + 1);
+	rte_spinlock_unlock(&denylog_shared_cfg->lock);
+}
+
+static void denylog6_add(uint64_t tsc, uint16_t in_port, const struct rte_ipv6_addr *src_ip6, const struct rte_ipv6_addr *dst_ip6,
+	uint8_t proto, uint16_t src_port, uint16_t dst_port, uint32_t rule_index) {
+	if (!denylog6_shared_cfg || !src_ip6 || !dst_ip6) {
+		return;
+	}
+	rte_spinlock_lock(&denylog6_shared_cfg->lock);
+	uint32_t pos = denylog6_shared_cfg->head;
+	struct denylog6_entry *e = &denylog6_shared_cfg->entries[pos];
+	e->tsc = tsc;
+	e->in_port = (uint8_t)in_port;
+	e->proto = proto;
+	e->src_ip6 = *src_ip6;
+	e->dst_ip6 = *dst_ip6;
+	e->src_port = src_port;
+	e->dst_port = dst_port;
+	e->rule_index = rule_index;
+	denylog6_shared_cfg->head = (pos + 1) % DENYLOG6_MAX;
+	if (denylog6_shared_cfg->count < DENYLOG6_MAX) {
+		denylog6_shared_cfg->count++;
+	}
+	uint64_t v = rte_atomic64_read(&denylog6_shared_cfg->version);
+	rte_atomic64_set(&denylog6_shared_cfg->version, v + 1);
+	rte_spinlock_unlock(&denylog6_shared_cfg->lock);
 }
 
 static int session_shared_sync(uint64_t now_tsc) {
@@ -285,6 +731,31 @@ static int session_shared_sync(uint64_t now_tsc) {
 	return 0;
 }
 
+static int session6_shared_sync(uint64_t now_tsc) {
+	if (!session6_shared_cfg) {
+		return -1;
+	}
+	uint32_t out = 0;
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		struct session6_table *table = session6_table_for_lcore(lcore_id);
+		if (!table) {
+			continue;
+		}
+		if (out >= SESSION6_MAX_EXPORT) {
+			break;
+		}
+		uint32_t left = SESSION6_MAX_EXPORT - out;
+		out += session6_export(table, &session6_shared_cfg->keys[out], &session6_shared_cfg->entries[out], left,
+			now_tsc, session_timeout_tsc);
+	}
+	session6_shared_cfg->count = out;
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&session6_shared_cfg->version);
+	rte_atomic64_set(&session6_shared_cfg->version, v + 1);
+	return 0;
+}
+
 static void session_expire_all(uint64_t now_tsc) {
 	unsigned lcore_id;
 	RTE_LCORE_FOREACH(lcore_id) {
@@ -294,6 +765,112 @@ static void session_expire_all(uint64_t now_tsc) {
 		}
 		session_soft_expire(table, now_tsc, session_timeout_tsc);
 	}
+}
+
+static void session6_expire_all(uint64_t now_tsc) {
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		struct session6_table *table = session6_table_for_lcore(lcore_id);
+		if (!table) {
+			continue;
+		}
+		session6_soft_expire(table, now_tsc, session_timeout_tsc);
+	}
+}
+
+static void route6_reclaim(void) {
+	if (!ipv6_rt_reclaim) {
+		return;
+	}
+	route6_table_free(ipv6_rt_reclaim);
+	ipv6_rt_reclaim = NULL;
+}
+
+static void route6_apply_shared_cfg(void) {
+	static uint64_t last_version;
+	if (!route6_shared_cfg) {
+		return;
+	}
+	uint64_t v = rte_atomic64_read(&route6_shared_cfg->version);
+	if (v == 0 || v == last_version) {
+		return;
+	}
+
+	struct ifcfg6_item ifs[IFACE6_MAX_PORTS];
+	struct route6_item routes[ROUTE6_MAX];
+	uint32_t count = 0;
+	uint64_t v2 = 0;
+	for (int i = 0; i < 200; i++) {
+		uint64_t v1 = rte_atomic64_read(&route6_shared_cfg->version);
+		uint32_t c = route6_shared_cfg->route_count;
+		if (c > ROUTE6_MAX) {
+			c = ROUTE6_MAX;
+		}
+		memcpy(ifs, route6_shared_cfg->ifcfg6s, sizeof(ifs));
+		memcpy(routes, route6_shared_cfg->routes, sizeof(struct route6_item) * c);
+		rte_rmb();
+		v2 = rte_atomic64_read(&route6_shared_cfg->version);
+		if (v1 == v2) {
+			count = c;
+			break;
+		}
+	}
+	if (v2 == 0 || v2 == last_version) {
+		return;
+	}
+
+	uint32_t cur = rte_atomic32_read(&ipv6_rt_active_idx) & 1u;
+	uint32_t next = cur ^ 1u;
+
+	struct nd_ifcfg *next_if = ifcfg6_tbls[next];
+	memset(next_if, 0, sizeof(ifcfg6_tbls[next]));
+	for (uint16_t p = 0; p < RTE_MAX_ETHPORTS && p < IFACE6_MAX_PORTS; p++) {
+		next_if[p].ip = ifs[p].ip;
+		next_if[p].depth = ifs[p].depth;
+		next_if[p].configured = ifs[p].configured;
+	}
+
+	int ipv6_on = 0;
+	for (uint16_t p = 0; p < RTE_MAX_ETHPORTS && p < IFACE6_MAX_PORTS; p++) {
+		if (next_if[p].configured) {
+			ipv6_on = 1;
+			break;
+		}
+	}
+	if (count) {
+		ipv6_on = 1;
+	}
+
+	struct route6_table *new_rt = NULL;
+	if (ipv6_on) {
+		char name[32];
+		snprintf(name, sizeof(name), "ipv6_rt_dyn_%u", next);
+		new_rt = route6_table_create(name, rte_socket_id(), 2048);
+		if (new_rt) {
+			const struct rte_ipv6_addr unspec = RTE_IPV6_ADDR_UNSPEC;
+			for (uint16_t p = 0; p < RTE_MAX_ETHPORTS && p < IFACE6_MAX_PORTS; p++) {
+				if (!next_if[p].configured) {
+					continue;
+				}
+				struct rte_ipv6_addr net = next_if[p].ip;
+				rte_ipv6_addr_mask(&net, next_if[p].depth);
+				route6_add(new_rt, &net, next_if[p].depth, &unspec, p);
+			}
+			for (uint32_t i = 0; i < count; i++) {
+				route6_add(new_rt, &routes[i].dst, routes[i].depth, &routes[i].next_hop, routes[i].out_port);
+			}
+		}
+	}
+
+	struct route6_table *old_rt = ipv6_rt_tbls[cur];
+	ipv6_rt_tbls[next] = new_rt;
+	rte_wmb();
+	rte_atomic32_set(&ifcfg6_active_idx, next);
+	rte_atomic32_set(&ipv6_rt_active_idx, next);
+	ipv6_rt_tbls[cur] = NULL;
+	ipv6_rt_reclaim = old_rt;
+
+	last_version = v2;
 }
 
 static int acl_runtime_init(void) {
@@ -420,6 +997,128 @@ static void *acl_ctrl_thread_main(void *arg) {
 	return NULL;
 }
 
+static int acl6_runtime_init(void) {
+	memset(&acl6_rt, 0, sizeof(acl6_rt));
+	rte_atomic32_init(&acl6_rt.active);
+	rte_atomic64_init(&acl6_rt.version);
+	if (acl6_init(&acl6_rt.ctx[0], ACL6_MAX_RULES) != 0) {
+		return -1;
+	}
+	if (acl6_init(&acl6_rt.ctx[1], ACL6_MAX_RULES) != 0) {
+		acl6_free(&acl6_rt.ctx[0]);
+		return -1;
+	}
+	if (acl6_seed_default_rules(&acl6_rt.ctx[0]) != 0) {
+		return -1;
+	}
+	if (acl6_clone(&acl6_rt.ctx[1], &acl6_rt.ctx[0]) != 0) {
+		return -1;
+	}
+	rte_atomic32_set(&acl6_rt.active, 0);
+	rte_atomic64_set(&acl6_rt.version, 1);
+	return 0;
+}
+
+static void acl6_runtime_free(void) {
+	acl6_free(&acl6_rt.ctx[0]);
+	acl6_free(&acl6_rt.ctx[1]);
+}
+
+static int acl6_send_resp(struct acl6_cmd_resp *resp) {
+	if (!resp) {
+		return -1;
+	}
+	if (!acl6_resp_ring) {
+		rte_free(resp);
+		return -1;
+	}
+	if (rte_ring_enqueue(acl6_resp_ring, resp) != 0) {
+		rte_free(resp);
+		return -1;
+	}
+	return 0;
+}
+
+static void acl6_send_list(uint32_t seq, const struct acl6_ctx *ctx, uint64_t version) {
+	uint32_t count = acl6_count(ctx);
+	struct acl6_cmd_resp *head = rte_zmalloc(NULL, sizeof(*head), 0);
+	if (!head) {
+		return;
+	}
+	head->seq = seq;
+	head->status = 0;
+	head->count = count;
+	head->version = version;
+	acl6_send_resp(head);
+}
+
+static int acl6_apply_cmd(const struct acl6_cmd_msg *cmd) {
+	if (!cmd) {
+		return -1;
+	}
+	const struct acl6_ctx *active = acl6_runtime_active_ctx();
+	uint32_t next_idx = (rte_atomic32_read(&acl6_rt.active) ^ 1u) & 1u;
+	struct acl6_ctx *next = &acl6_rt.ctx[next_idx];
+	if (acl6_clone(next, active) != 0) {
+		return -1;
+	}
+	int rc = 0;
+	switch (cmd->type) {
+	case ACL6_CMD_ADD:
+		rc = acl6_add_rule(next, &cmd->rule);
+		break;
+	case ACL6_CMD_DEL:
+		rc = acl6_delete_rule(next, cmd->index);
+		break;
+	case ACL6_CMD_CLEAR:
+		acl6_clear(next);
+		rc = 0;
+		break;
+	default:
+		rc = -1;
+		break;
+	}
+	if (rc != 0) {
+		return -1;
+	}
+	uint64_t version = rte_atomic64_add_return(&acl6_rt.version, 1);
+	rte_wmb();
+	rte_atomic32_set(&acl6_rt.active, next_idx);
+	acl6_shared_sync(next, version);
+	return 0;
+}
+
+static void *acl6_ctrl_thread_main(void *arg) {
+	(void)arg;
+	while (!force_quit) {
+		struct acl6_cmd_msg *cmd = NULL;
+		if (rte_ring_dequeue(acl6_cmd_ring, (void **)&cmd) != 0) {
+			rte_delay_us_sleep(1000);
+			continue;
+		}
+		if (!cmd) {
+			continue;
+		}
+		if (cmd->type == ACL6_CMD_LIST) {
+			uint64_t version = rte_atomic64_read(&acl6_rt.version);
+			acl6_send_list(cmd->seq, acl6_runtime_active_ctx(), version);
+			rte_free(cmd);
+			continue;
+		}
+		int status = acl6_apply_cmd(cmd);
+		struct acl6_cmd_resp *resp = rte_zmalloc(NULL, sizeof(*resp), 0);
+		if (resp) {
+			resp->seq = cmd->seq;
+			resp->status = status;
+			resp->count = acl6_count(acl6_runtime_active_ctx());
+			resp->version = rte_atomic64_read(&acl6_rt.version);
+			acl6_send_resp(resp);
+		}
+		rte_free(cmd);
+	}
+	return NULL;
+}
+
 /* Print out statistics on packets dropped */
 static void
 print_stats(void)
@@ -517,7 +1216,8 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			port_statistics[portid].dropped++;
 			return;
 		}
-		if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+		if (eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) &&
+			eth->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)) {
 			rte_pktmbuf_free(m);
 			port_statistics[portid].dropped++;
 			return;
@@ -532,7 +1232,60 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			if (pkt_len >= ip_offset + ihl) {
 				l4_hdr = (char *)ip + ihl;
 			}
-			if (!acl_check_ipv4(acl_runtime_active_ctx(), ip, l4_hdr)) {
+			if (rlim_syn_pps || rlim_udp_pps) {
+				unsigned lcore_id = rte_lcore_id();
+				struct rlim_table *syn_t = NULL;
+				struct rlim_table *udp_t = NULL;
+				if (lcore_id < RTE_MAX_LCORE && rlim_inited[lcore_id]) {
+					syn_t = &rlim_syn_tbls[lcore_id];
+					udp_t = &rlim_udp_tbls[lcore_id];
+				}
+				uint64_t now = rte_get_timer_cycles();
+				uint64_t hz = rte_get_timer_hz();
+				uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
+				if (l4_hdr && ip->next_proto_id == IPPROTO_TCP && rlim_syn_pps) {
+					const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+					uint8_t f = tcp->tcp_flags;
+					if ((f & 0x02) && !(f & 0x10)) {
+						if (!rlim_allow(syn_t, &src_ip, now, hz, rlim_syn_pps, rlim_syn_burst)) {
+							rte_pktmbuf_free(m);
+							port_statistics[portid].dropped++;
+							return;
+						}
+					}
+				} else if (l4_hdr && ip->next_proto_id == IPPROTO_UDP && rlim_udp_pps) {
+					if (!rlim_allow(udp_t, &src_ip, now, hz, rlim_udp_pps, rlim_udp_burst)) {
+						rte_pktmbuf_free(m);
+						port_statistics[portid].dropped++;
+						return;
+					}
+				}
+			}
+			uint32_t deny_rule_index = UINT32_MAX;
+			if (!acl_check_ipv4(acl_runtime_active_ctx(), ip, l4_hdr, &deny_rule_index)) {
+				uint16_t src_port = 0;
+				uint16_t dst_port = 0;
+				if (l4_hdr && (ip->next_proto_id == IPPROTO_TCP || ip->next_proto_id == IPPROTO_UDP)) {
+					if (ip->next_proto_id == IPPROTO_TCP) {
+						const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+						src_port = rte_be_to_cpu_16(tcp->src_port);
+						dst_port = rte_be_to_cpu_16(tcp->dst_port);
+					} else {
+						const struct rte_udp_hdr *udp = (const struct rte_udp_hdr *)l4_hdr;
+						src_port = rte_be_to_cpu_16(udp->src_port);
+						dst_port = rte_be_to_cpu_16(udp->dst_port);
+					}
+				}
+				denylog_add(
+					rte_get_timer_cycles(),
+					(uint16_t)portid,
+					rte_be_to_cpu_32(ip->src_addr),
+					rte_be_to_cpu_32(ip->dst_addr),
+					ip->next_proto_id,
+					src_port,
+					dst_port,
+					deny_rule_index
+				);
 				rte_pktmbuf_free(m);
 				port_statistics[portid].dropped++;
 				return;
@@ -600,6 +1353,173 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 					arp_mark_requested(arp_tbl, next_ip, now);
 					struct rte_mbuf *req = arp_build_request(l2fwd_pktmbuf_pool,
 						&l2fwd_ports_eth_addr[dst_port], ifcfgs[dst_port].ip, next_ip);
+					if (req) {
+						buffer = tx_buffer[dst_port];
+						sent = rte_eth_tx_buffer(dst_port, 0, buffer, req);
+						if (sent)
+							port_statistics[dst_port].tx += sent;
+					}
+				}
+				rte_pktmbuf_free(m);
+				port_statistics[portid].dropped++;
+				return;
+			}
+		}
+	}
+	if (eth->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)) {
+		uint16_t l3_off = sizeof(struct rte_ether_hdr);
+		pkt_len = rte_pktmbuf_data_len(m);
+		if (pkt_len >= l3_off + sizeof(struct rte_ipv6_hdr)) {
+			struct rte_ipv6_hdr *ip6 = (struct rte_ipv6_hdr *)((char *)eth + l3_off);
+			struct route6_table *rt6 = ipv6_rt_active();
+			struct nd_ifcfg *if6 = ifcfg6_active();
+			uint16_t l4_off = l3_off + sizeof(struct rte_ipv6_hdr);
+			int proto = ip6->proto;
+			while (l4_off < pkt_len) {
+				if (proto == IPPROTO_TCP || proto == IPPROTO_UDP || proto == IPPROTO_ICMPV6) {
+					l4_hdr = (char *)eth + l4_off;
+					break;
+				}
+				size_t ext_len = 0;
+				int next = rte_ipv6_get_next_ext((const uint8_t *)eth + l4_off, proto, &ext_len);
+				if (next < 0 || ext_len == 0) {
+					break;
+				}
+				if (l4_off + (uint16_t)ext_len > pkt_len) {
+					break;
+				}
+				l4_off += (uint16_t)ext_len;
+				proto = next;
+			}
+
+			if (rt6 && nd_tbl && l4_hdr && proto == IPPROTO_ICMPV6) {
+				uint16_t txp = 0;
+				int send_reply = nd_process_packet(nd_tbl, m, (uint16_t)portid, if6, l2fwd_ports_eth_addr,
+					RTE_MAX_ETHPORTS, &txp);
+				if (send_reply) {
+					buffer = tx_buffer[txp];
+					sent = rte_eth_tx_buffer(txp, 0, buffer, m);
+					if (sent)
+						port_statistics[txp].tx += sent;
+					return;
+				}
+				rte_pktmbuf_free(m);
+				port_statistics[portid].dropped++;
+				return;
+			}
+
+			if (rt6) {
+				uint32_t deny_rule_index = UINT32_MAX;
+				if (!acl6_check_ipv6(acl6_runtime_active_ctx(), ip6, l4_hdr, &deny_rule_index)) {
+					uint16_t src_port = 0;
+					uint16_t dst_port = 0;
+					if (l4_hdr && (proto == IPPROTO_TCP || proto == IPPROTO_UDP)) {
+						if (proto == IPPROTO_TCP) {
+							const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+							src_port = rte_be_to_cpu_16(tcp->src_port);
+							dst_port = rte_be_to_cpu_16(tcp->dst_port);
+						} else {
+							const struct rte_udp_hdr *udp = (const struct rte_udp_hdr *)l4_hdr;
+							src_port = rte_be_to_cpu_16(udp->src_port);
+							dst_port = rte_be_to_cpu_16(udp->dst_port);
+						}
+					}
+					denylog6_add(rte_get_timer_cycles(), (uint16_t)portid, &ip6->src_addr, &ip6->dst_addr,
+						(uint8_t)proto, src_port, dst_port, deny_rule_index);
+					rte_pktmbuf_free(m);
+					port_statistics[portid].dropped++;
+					return;
+				}
+				if (l4_hdr && (proto == IPPROTO_TCP || proto == IPPROTO_UDP)) {
+					struct session6_key sk;
+					memset(&sk, 0, sizeof(sk));
+					sk.src_ip6 = ip6->src_addr;
+					sk.dst_ip6 = ip6->dst_addr;
+					sk.proto = (uint8_t)proto;
+					if (proto == IPPROTO_TCP) {
+						const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+						sk.src_port = rte_be_to_cpu_16(tcp->src_port);
+						sk.dst_port = rte_be_to_cpu_16(tcp->dst_port);
+					} else {
+						const struct rte_udp_hdr *udp = (const struct rte_udp_hdr *)l4_hdr;
+						sk.src_port = rte_be_to_cpu_16(udp->src_port);
+						sk.dst_port = rte_be_to_cpu_16(udp->dst_port);
+					}
+					uint64_t now = rte_get_timer_cycles();
+					session6_track(session6_table_for_lcore(rte_lcore_id()), &sk, pkt_len, now, NULL);
+				}
+			}
+
+			if (rlim_syn_pps || rlim_udp_pps) {
+				unsigned lcore_id = rte_lcore_id();
+				struct rlim_table *syn_t = NULL;
+				struct rlim_table *udp_t = NULL;
+				if (lcore_id < RTE_MAX_LCORE && rlim_inited[lcore_id]) {
+					syn_t = &rlim6_syn_tbls[lcore_id];
+					udp_t = &rlim6_udp_tbls[lcore_id];
+				}
+				uint64_t now = rte_get_timer_cycles();
+				uint64_t hz = rte_get_timer_hz();
+				const void *src_key = &ip6->src_addr;
+				if (l4_hdr && proto == IPPROTO_TCP && rlim_syn_pps) {
+					const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+					uint8_t f = tcp->tcp_flags;
+					if ((f & 0x02) && !(f & 0x10)) {
+						if (!rlim_allow(syn_t, src_key, now, hz, rlim_syn_pps, rlim_syn_burst)) {
+							rte_pktmbuf_free(m);
+							port_statistics[portid].dropped++;
+							return;
+						}
+					}
+				} else if (l4_hdr && proto == IPPROTO_UDP && rlim_udp_pps) {
+					if (!rlim_allow(udp_t, src_key, now, hz, rlim_udp_pps, rlim_udp_burst)) {
+						rte_pktmbuf_free(m);
+						port_statistics[portid].dropped++;
+						return;
+					}
+				}
+			}
+
+			if (rt6 && nd_tbl) {
+				for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+					if (if6[p].configured && rte_ipv6_addr_eq(&ip6->dst_addr, &if6[p].ip)) {
+						rte_pktmbuf_free(m);
+						port_statistics[portid].dropped++;
+						return;
+					}
+				}
+				if (ip6->hop_limits <= 1) {
+					rte_pktmbuf_free(m);
+					port_statistics[portid].dropped++;
+					return;
+				}
+				ip6->hop_limits--;
+
+				struct route6_entry re6;
+				if (route6_lookup(rt6, &ip6->dst_addr, &re6) != 0) {
+					rte_pktmbuf_free(m);
+					port_statistics[portid].dropped++;
+					return;
+				}
+				dst_port = re6.out_port;
+
+				struct rte_ipv6_addr next_ip6 = rte_ipv6_addr_is_unspec(&re6.next_hop) ? ip6->dst_addr : re6.next_hop;
+				struct rte_ether_addr nh_mac6;
+				if (nd_lookup(nd_tbl, &next_ip6, &nh_mac6) == 0) {
+					rte_ether_addr_copy(&nh_mac6, &eth->dst_addr);
+					rte_ether_addr_copy(&l2fwd_ports_eth_addr[dst_port], &eth->src_addr);
+					buffer = tx_buffer[dst_port];
+					sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
+					if (sent)
+						port_statistics[dst_port].tx += sent;
+					return;
+				}
+
+				if (if6[dst_port].configured && nd_should_request(nd_tbl, &next_ip6)) {
+					uint64_t now = rte_get_timer_cycles();
+					nd_mark_requested(nd_tbl, &next_ip6, now);
+					struct rte_mbuf *req = nd_build_ns(l2fwd_pktmbuf_pool,
+						&l2fwd_ports_eth_addr[dst_port], &if6[dst_port].ip, &next_ip6);
 					if (req) {
 						buffer = tx_buffer[dst_port];
 						sent = rte_eth_tx_buffer(dst_port, 0, buffer, req);
@@ -694,8 +1614,14 @@ l2fwd_main_loop(void)
 					/* do this only on main core */
 					if (lcore_id == rte_get_main_lcore()) {
 						uint64_t now = rte_get_timer_cycles();
+						rlim_apply_shared_cfg();
+						route6_reclaim();
+						route6_apply_shared_cfg();
 						session_expire_all(now);
 						session_shared_sync(now);
+						session6_expire_all(now);
+						session6_shared_sync(now);
+						portstats_shared_sync();
 						print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
@@ -750,8 +1676,12 @@ l2fwd_usage(const char *prgname)
 	       "       - The source MAC address is replaced by the TX port MAC address\n"
 	       "       - The destination MAC address is replaced by 02:00:00:00:00:TX_PORT_ID\n"
 	       "  --ifcfg PORT,IP/CIDR: Configure IPv4 address on port (enables routing mode)\n"
+	       "  --ifcfg6 PORT,IP6/CIDR: Configure IPv6 address on port (enables routing mode)\n"
 	       "  --route DST/CIDR,NEXTHOP,PORT: Add IPv4 route (NEXTHOP can be 0.0.0.0 for direct)\n"
+	       "  --route6 DST6/CIDR,NEXTHOP6,PORT: Add IPv6 route (NEXTHOP6 can be :: for direct)\n"
 	       "  --session-timeout-sec SEC: Expire sessions after SEC seconds (0 disables)\n"
+	       "  --rlim-syn PPS[,BURST]: Per-source TCP SYN rate limit (0 disables)\n"
+	       "  --rlim-udp PPS[,BURST]: Per-source UDP rate limit (0 disables)\n"
 	       "  --portmap: Configure forwarding port pair mapping\n"
 	       "	      Default: alternate port pairs\n\n",
 	       prgname);
@@ -888,6 +1818,42 @@ static uint32_t cidr_depth_to_mask(uint8_t depth) {
 	return 0xFFFFFFFFu << (32 - depth);
 }
 
+static int parse_rlim_arg(const char *s, uint32_t *pps_out, uint32_t *burst_out) {
+	if (!s || !pps_out || !burst_out) {
+		return -1;
+	}
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *comma = strchr(buf, ',');
+	if (comma) {
+		*comma = '\0';
+	}
+	char *endp = NULL;
+	unsigned long pps = strtoul(buf, &endp, 10);
+	if (!buf[0] || (endp && *endp)) {
+		return -1;
+	}
+	unsigned long burst = pps;
+	if (comma) {
+		endp = NULL;
+		burst = strtoul(comma + 1, &endp, 10);
+		if (!comma[1] || (endp && *endp)) {
+			return -1;
+		}
+	}
+	if (pps == 0) {
+		*pps_out = 0;
+		*burst_out = 0;
+		return 0;
+	}
+	if (burst == 0) {
+		return -1;
+	}
+	*pps_out = (uint32_t)pps;
+	*burst_out = (uint32_t)burst;
+	return 0;
+}
+
 static int parse_ifcfg_arg(const char *s) {
 	if (!s) {
 		return -1;
@@ -965,6 +1931,118 @@ static int parse_route_arg(const char *s) {
 	return 0;
 }
 
+static int parse_ipv6_addr(const char *s, struct rte_ipv6_addr *out) {
+	if (!s || !out) {
+		return -1;
+	}
+	struct in6_addr a6;
+	if (inet_pton(AF_INET6, s, &a6) != 1) {
+		return -1;
+	}
+	memcpy(out, &a6, sizeof(*out));
+	return 0;
+}
+
+static int parse_ipv6_cidr(const char *s, struct rte_ipv6_addr *ip, uint8_t *depth) {
+	if (!s || !ip || !depth) {
+		return -1;
+	}
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *slash = strchr(buf, '/');
+	if (!slash) {
+		return -1;
+	}
+	*slash = '\0';
+	const char *ip_str = buf;
+	const char *d_str = slash + 1;
+	unsigned long d = strtoul(d_str, NULL, 10);
+	if (d > 128) {
+		return -1;
+	}
+	if (parse_ipv6_addr(ip_str, ip) != 0) {
+		return -1;
+	}
+	*depth = (uint8_t)d;
+	return 0;
+}
+
+static int parse_ifcfg6_arg(const char *s) {
+	if (!s) {
+		return -1;
+	}
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *comma = strchr(buf, ',');
+	if (!comma) {
+		return -1;
+	}
+	*comma = '\0';
+	const char *port_str = buf;
+	const char *cidr_str = comma + 1;
+	unsigned long port = strtoul(port_str, NULL, 10);
+	if (port >= RTE_MAX_ETHPORTS) {
+		return -1;
+	}
+	struct rte_ipv6_addr ip6;
+	uint8_t depth = 0;
+	if (parse_ipv6_cidr(cidr_str, &ip6, &depth) != 0) {
+		return -1;
+	}
+	ifcfg6_tbls[0][port].ip = ip6;
+	ifcfg6_tbls[0][port].depth = depth;
+	ifcfg6_tbls[0][port].configured = 1;
+	routing_on = 1;
+	return 0;
+}
+
+static int parse_route6_arg(const char *s) {
+	if (!s) {
+		return -1;
+	}
+	if (pending_route6_count >= MAX_PENDING_ROUTES) {
+		return -1;
+	}
+	char buf[512];
+	snprintf(buf, sizeof(buf), "%s", s);
+	char *c1 = strchr(buf, ',');
+	if (!c1) {
+		return -1;
+	}
+	*c1 = '\0';
+	char *c2 = strchr(c1 + 1, ',');
+	if (!c2) {
+		return -1;
+	}
+	*c2 = '\0';
+	const char *dst_cidr = buf;
+	const char *nh_str = c1 + 1;
+	const char *port_str = c2 + 1;
+
+	struct rte_ipv6_addr dst;
+	uint8_t depth = 0;
+	if (parse_ipv6_cidr(dst_cidr, &dst, &depth) != 0) {
+		return -1;
+	}
+	struct rte_ipv6_addr nh = RTE_IPV6_ADDR_UNSPEC;
+	if (strcmp(nh_str, "::") != 0) {
+		if (parse_ipv6_addr(nh_str, &nh) != 0) {
+			return -1;
+		}
+	}
+	unsigned long port = strtoul(port_str, NULL, 10);
+	if (port >= RTE_MAX_ETHPORTS) {
+		return -1;
+	}
+	pending_routes6[pending_route6_count].dst_ip = dst;
+	pending_routes6[pending_route6_count].depth = depth;
+	pending_routes6[pending_route6_count].next_hop_ip = nh;
+	pending_routes6[pending_route6_count].out_port = (uint16_t)port;
+	pending_route6_count++;
+	routing_on = 1;
+	return 0;
+}
+
 static int
 l2fwd_parse_timer_period(const char *q_arg)
 {
@@ -991,8 +2069,12 @@ static const char short_options[] =
 #define CMD_LINE_OPT_NO_MAC_UPDATING "no-mac-updating"
 #define CMD_LINE_OPT_PORTMAP_CONFIG "portmap"
 #define CMD_LINE_OPT_IFCFG "ifcfg"
+#define CMD_LINE_OPT_IFCFG6 "ifcfg6"
 #define CMD_LINE_OPT_ROUTE "route"
+#define CMD_LINE_OPT_ROUTE6 "route6"
 #define CMD_LINE_OPT_SESSION_TIMEOUT "session-timeout-sec"
+#define CMD_LINE_OPT_RLIM_SYN "rlim-syn"
+#define CMD_LINE_OPT_RLIM_UDP "rlim-udp"
  
 enum {
 	/* long options mapped to a short option */
@@ -1002,8 +2084,12 @@ enum {
 	CMD_LINE_OPT_NO_MAC_UPDATING_NUM = 256,
 	CMD_LINE_OPT_PORTMAP_NUM,
 	CMD_LINE_OPT_IFCFG_NUM,
+	CMD_LINE_OPT_IFCFG6_NUM,
 	CMD_LINE_OPT_ROUTE_NUM,
+	CMD_LINE_OPT_ROUTE6_NUM,
 	CMD_LINE_OPT_SESSION_TIMEOUT_NUM,
+	CMD_LINE_OPT_RLIM_SYN_NUM,
+	CMD_LINE_OPT_RLIM_UDP_NUM,
 };
  
 static const struct option lgopts[] = {
@@ -1011,8 +2097,12 @@ static const struct option lgopts[] = {
 		CMD_LINE_OPT_NO_MAC_UPDATING_NUM},
 	{ CMD_LINE_OPT_PORTMAP_CONFIG, 1, 0, CMD_LINE_OPT_PORTMAP_NUM},
 	{ CMD_LINE_OPT_IFCFG, 1, 0, CMD_LINE_OPT_IFCFG_NUM},
+	{ CMD_LINE_OPT_IFCFG6, 1, 0, CMD_LINE_OPT_IFCFG6_NUM},
 	{ CMD_LINE_OPT_ROUTE, 1, 0, CMD_LINE_OPT_ROUTE_NUM},
+	{ CMD_LINE_OPT_ROUTE6, 1, 0, CMD_LINE_OPT_ROUTE6_NUM},
 	{ CMD_LINE_OPT_SESSION_TIMEOUT, 1, 0, CMD_LINE_OPT_SESSION_TIMEOUT_NUM},
+	{ CMD_LINE_OPT_RLIM_SYN, 1, 0, CMD_LINE_OPT_RLIM_SYN_NUM},
+	{ CMD_LINE_OPT_RLIM_UDP, 1, 0, CMD_LINE_OPT_RLIM_UDP_NUM},
 	{NULL, 0, 0, 0}
 };
  
@@ -1087,10 +2177,24 @@ l2fwd_parse_args(int argc, char **argv)
 				return -1;
 			}
 			break;
+		case CMD_LINE_OPT_IFCFG6_NUM:
+			if (parse_ifcfg6_arg(optarg) != 0) {
+				fprintf(stderr, "Invalid ifcfg6\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
 
 		case CMD_LINE_OPT_ROUTE_NUM:
 			if (parse_route_arg(optarg) != 0) {
 				fprintf(stderr, "Invalid route\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
+		case CMD_LINE_OPT_ROUTE6_NUM:
+			if (parse_route6_arg(optarg) != 0) {
+				fprintf(stderr, "Invalid route6\n");
 				l2fwd_usage(prgname);
 				return -1;
 			}
@@ -1107,6 +2211,20 @@ l2fwd_parse_args(int argc, char **argv)
 			session_timeout_tsc = (uint64_t)v * rte_get_timer_hz();
 			break;
 		}
+		case CMD_LINE_OPT_RLIM_SYN_NUM:
+			if (parse_rlim_arg(optarg, &rlim_syn_pps, &rlim_syn_burst) != 0) {
+				fprintf(stderr, "Invalid rlim-syn\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
+		case CMD_LINE_OPT_RLIM_UDP_NUM:
+			if (parse_rlim_arg(optarg, &rlim_udp_pps, &rlim_udp_burst) != 0) {
+				fprintf(stderr, "Invalid rlim-udp\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
 
 		default:
 			l2fwd_usage(prgname);
@@ -1264,6 +2382,15 @@ main(int argc, char **argv)
 	force_quit = false;
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+
+	rte_atomic32_init(&ipv6_rt_active_idx);
+	rte_atomic32_init(&ifcfg6_active_idx);
+	rte_atomic32_set(&ipv6_rt_active_idx, 0);
+	rte_atomic32_set(&ifcfg6_active_idx, 0);
+	memset(ifcfg6_tbls, 0, sizeof(ifcfg6_tbls));
+	ipv6_rt_tbls[0] = NULL;
+	ipv6_rt_tbls[1] = NULL;
+	ipv6_rt_reclaim = NULL;
  
 	/* parse application arguments (after the EAL ones) */
 	ret = l2fwd_parse_args(argc, argv);
@@ -1394,23 +2521,99 @@ main(int argc, char **argv)
 			route_add(ipv4_rt, pending_routes[i].dst_ip, pending_routes[i].depth,
 				pending_routes[i].next_hop_ip, pending_routes[i].out_port);
 		}
+
+		int ipv6_on = 0;
+		for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+			if (ifcfg6_tbls[0][p].configured) {
+				ipv6_on = 1;
+				break;
+			}
+		}
+		if (pending_route6_count) {
+			ipv6_on = 1;
+		}
+		if (ipv6_on) {
+			nd_tbl = nd_table_create("nd_cache", rte_socket_id(), 2048, 300, 500);
+			if (!nd_tbl)
+				rte_exit(EXIT_FAILURE, "Cannot init ND table\n");
+			ipv6_rt_tbls[0] = route6_table_create("ipv6_rt", rte_socket_id(), 2048);
+			if (!ipv6_rt_tbls[0])
+				rte_exit(EXIT_FAILURE, "Cannot init IPv6 route table\n");
+
+			const struct rte_ipv6_addr unspec = RTE_IPV6_ADDR_UNSPEC;
+			for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+				if (!ifcfg6_tbls[0][p].configured)
+					continue;
+				struct rte_ipv6_addr net = ifcfg6_tbls[0][p].ip;
+				rte_ipv6_addr_mask(&net, ifcfg6_tbls[0][p].depth);
+				route6_add(ipv6_rt_tbls[0], &net, ifcfg6_tbls[0][p].depth, &unspec, p);
+			}
+			for (uint32_t i = 0; i < pending_route6_count; i++) {
+				route6_add(ipv6_rt_tbls[0], &pending_routes6[i].dst_ip, pending_routes6[i].depth,
+					&pending_routes6[i].next_hop_ip, pending_routes6[i].out_port);
+			}
+		}
 	}
 
 	if (acl_runtime_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init ACL runtime\n");
 	if (acl_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init ACL IPC\n");
+	if (acl6_runtime_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init ACL6 runtime\n");
+	if (acl6_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init ACL6 IPC\n");
 	RTE_LCORE_FOREACH(lcore_id) {
 		char name[64];
 		snprintf(name, sizeof(name), "session_table_%u", lcore_id);
 		if (session_table_init(&session_tables[lcore_id], name, 65536, rte_socket_id()) != 0)
 			rte_exit(EXIT_FAILURE, "Cannot init session table for lcore %u\n", lcore_id);
 		session_table_inited[lcore_id] = 1;
+		snprintf(name, sizeof(name), "session6_table_%u", lcore_id);
+		if (session6_table_init(&session6_tables[lcore_id], name, 65536, rte_socket_id()) != 0)
+			rte_exit(EXIT_FAILURE, "Cannot init session6 table for lcore %u\n", lcore_id);
+		session6_table_inited[lcore_id] = 1;
+	}
+	if (rlim_syn_pps || rlim_udp_pps) {
+		RTE_LCORE_FOREACH(lcore_id) {
+			char name[64];
+			if (rlim_syn_pps) {
+				snprintf(name, sizeof(name), "rlim_syn_%u", lcore_id);
+				if (rlim_table_init(&rlim_syn_tbls[lcore_id], name, 32768, sizeof(uint32_t), rte_socket_id()) != 0)
+					rte_exit(EXIT_FAILURE, "Cannot init rlim syn table for lcore %u\n", lcore_id);
+				snprintf(name, sizeof(name), "rlim6_syn_%u", lcore_id);
+				if (rlim_table_init(&rlim6_syn_tbls[lcore_id], name, 32768, sizeof(struct rte_ipv6_addr), rte_socket_id()) != 0)
+					rte_exit(EXIT_FAILURE, "Cannot init rlim6 syn table for lcore %u\n", lcore_id);
+			}
+			if (rlim_udp_pps) {
+				snprintf(name, sizeof(name), "rlim_udp_%u", lcore_id);
+				if (rlim_table_init(&rlim_udp_tbls[lcore_id], name, 32768, sizeof(uint32_t), rte_socket_id()) != 0)
+					rte_exit(EXIT_FAILURE, "Cannot init rlim udp table for lcore %u\n", lcore_id);
+				snprintf(name, sizeof(name), "rlim6_udp_%u", lcore_id);
+				if (rlim_table_init(&rlim6_udp_tbls[lcore_id], name, 32768, sizeof(struct rte_ipv6_addr), rte_socket_id()) != 0)
+					rte_exit(EXIT_FAILURE, "Cannot init rlim6 udp table for lcore %u\n", lcore_id);
+			}
+			rlim_inited[lcore_id] = 1;
+		}
 	}
 	if (session_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init session IPC\n");
+	if (session6_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init session6 IPC\n");
+	if (portstats_ipc_init(RTE_MAX_ETHPORTS) != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init portstats IPC\n");
+	if (denylog_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init denylog IPC\n");
+	if (denylog6_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init denylog6 IPC\n");
+	if (route6_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init route6 IPC\n");
+	if (rlim_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init rlim IPC\n");
 	if (pthread_create(&acl_ctrl_thread, NULL, acl_ctrl_thread_main, NULL) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot start ACL control thread\n");
+	if (pthread_create(&acl6_ctrl_thread, NULL, acl6_ctrl_thread_main, NULL) != 0)
+		rte_exit(EXIT_FAILURE, "Cannot start ACL6 control thread\n");
  
 	/* Initialise each port */
 	RTE_ETH_FOREACH_DEV(portid) {
@@ -1538,6 +2741,10 @@ main(int argc, char **argv)
 	}
  
 	check_all_ports_link_status(l2fwd_enabled_port_mask);
+
+	if (routing_on) {
+		send_gratuitous_arp();
+	}
  
 	ret = 0;
 	/* launch per-lcore init on every lcore */
@@ -1564,12 +2771,35 @@ main(int argc, char **argv)
 	force_quit = true;
 	pthread_join(acl_ctrl_thread, NULL);
 	acl_runtime_free();
+	pthread_join(acl6_ctrl_thread, NULL);
+	acl6_runtime_free();
 	arp_table_free(arp_tbl);
 	route_table_free(ipv4_rt);
+	nd_table_free(nd_tbl);
+	route6_reclaim();
+	if (ipv6_rt_tbls[0]) {
+		route6_table_free(ipv6_rt_tbls[0]);
+		ipv6_rt_tbls[0] = NULL;
+	}
+	if (ipv6_rt_tbls[1]) {
+		route6_table_free(ipv6_rt_tbls[1]);
+		ipv6_rt_tbls[1] = NULL;
+	}
 	RTE_LCORE_FOREACH(lcore_id) {
 		if (session_table_inited[lcore_id]) {
 			session_table_free(&session_tables[lcore_id]);
 			session_table_inited[lcore_id] = 0;
+		}
+		if (session6_table_inited[lcore_id]) {
+			session6_table_free(&session6_tables[lcore_id]);
+			session6_table_inited[lcore_id] = 0;
+		}
+		if (rlim_inited[lcore_id]) {
+			rlim_table_free(&rlim_syn_tbls[lcore_id]);
+			rlim_table_free(&rlim_udp_tbls[lcore_id]);
+			rlim_table_free(&rlim6_syn_tbls[lcore_id]);
+			rlim_table_free(&rlim6_udp_tbls[lcore_id]);
+			rlim_inited[lcore_id] = 0;
 		}
 	}
 	rte_eal_cleanup();

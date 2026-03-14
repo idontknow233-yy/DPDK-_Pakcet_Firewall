@@ -52,7 +52,18 @@ func main() {
 	mux.HandleFunc("/api/health", h.Health)
 	mux.HandleFunc("/api/acl", h.Acl)
 	mux.HandleFunc("/api/acl/", h.AclItem)
+	mux.HandleFunc("/api/acl6", h.Acl6)
+	mux.HandleFunc("/api/acl6/", h.Acl6Item)
+	mux.HandleFunc("/api/ifcfg6", h.Ifcfg6)
+	mux.HandleFunc("/api/ifcfg6/", h.Ifcfg6Item)
+	mux.HandleFunc("/api/route6", h.Route6)
+	mux.HandleFunc("/api/route6/", h.Route6Item)
 	mux.HandleFunc("/api/sessions", h.Sessions)
+	mux.HandleFunc("/api/sessions6", h.Sessions6)
+	mux.HandleFunc("/api/ports", h.PortStats)
+	mux.HandleFunc("/api/denies", h.Denies)
+	mux.HandleFunc("/api/denies6", h.Denies6)
+	mux.HandleFunc("/api/ddos", h.Ddos)
 
 	srv := &http.Server{
 		Addr:              addr,

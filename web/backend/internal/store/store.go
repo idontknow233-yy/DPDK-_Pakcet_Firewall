@@ -128,11 +128,16 @@ func (s *Store) Add(r Rule) error {
 	if act != "allow" && act != "deny" {
 		return errors.New("bad action")
 	}
-	if _, _, err := net.ParseCIDR(r.Src); err != nil {
+	srcIP, _, err := net.ParseCIDR(r.Src)
+	if err != nil {
 		return errors.New("bad src cidr")
 	}
-	if _, _, err := net.ParseCIDR(r.Dst); err != nil {
+	dstIP, _, err := net.ParseCIDR(r.Dst)
+	if err != nil {
 		return errors.New("bad dst cidr")
+	}
+	if (srcIP.To4() != nil) != (dstIP.To4() != nil) {
+		return errors.New("cidr family mismatch")
 	}
 	if r.Proto < 0 || r.Proto > 255 {
 		return errors.New("bad proto")
@@ -154,8 +159,52 @@ func (s *Store) Clear() error {
 	return err
 }
 
+func (s *Store) ListByFamily(v6 bool) ([]Rule, error) {
+	rules, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Rule, 0, len(rules))
+	for _, r := range rules {
+		ip, _, err := net.ParseCIDR(r.Src)
+		if err != nil {
+			continue
+		}
+		is6 := ip.To4() == nil
+		if is6 == v6 {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) ClearByFamily(v6 bool) error {
+	rules, err := s.ListByFamily(v6)
+	if err != nil {
+		return err
+	}
+	for _, r := range rules {
+		if _, err := s.db.Exec(`DELETE FROM acl_rules WHERE id = ?`, r.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) DeleteByIndex(index int) error {
 	rules, err := s.List()
+	if err != nil {
+		return err
+	}
+	if index < 0 || index >= len(rules) {
+		return errors.New("index out of range")
+	}
+	_, err = s.db.Exec(`DELETE FROM acl_rules WHERE id = ?`, rules[index].ID)
+	return err
+}
+
+func (s *Store) DeleteByIndexByFamily(index int, v6 bool) error {
+	rules, err := s.ListByFamily(v6)
 	if err != nil {
 		return err
 	}

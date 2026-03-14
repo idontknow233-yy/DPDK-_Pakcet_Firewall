@@ -188,8 +188,11 @@ void acl_free(struct acl_ctx *ctx) {
 	ctx->capacity = 0;
 }
 
-bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, const void *l4_hdr) {
+bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, const void *l4_hdr, uint32_t *deny_rule_index) {
 	if (!ctx || !ctx->rules || !ip) {
+		if (deny_rule_index) {
+			*deny_rule_index = UINT32_MAX;
+		}
 		return true;
 	}
 	uint32_t src = rte_be_to_cpu_32(ip->src_addr);
@@ -223,11 +226,17 @@ bool acl_check_ipv4(const struct acl_ctx *ctx, const struct rte_ipv4_hdr *ip, co
 			continue;
 		}
 		if (!rule->allow) {
+			if (deny_rule_index) {
+				*deny_rule_index = i;
+			}
 			rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
 			return false;
 		}
 	}
 	rte_rwlock_read_unlock((rte_rwlock_t *)&ctx->lock);
+	if (deny_rule_index) {
+		*deny_rule_index = UINT32_MAX;
+	}
 
 	return true;
 }

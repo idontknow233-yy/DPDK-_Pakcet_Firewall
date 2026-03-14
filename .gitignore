@@ -7,3 +7,4 @@
 /web/backend/*.db
 /web/backend/*.db-shm
 /web/backend/*.db-wal
+/log/

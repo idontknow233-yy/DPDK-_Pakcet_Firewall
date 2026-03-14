@@ -7,10 +7,22 @@
       </el-radio-group>
     </el-form-item>
     <el-form-item label="源IP" prop="src">
-      <el-input v-model="form.src" placeholder="例如 192.168.1.0/24" clearable />
+      <div class="ip-input">
+        <el-select v-model="form.srcAny" style="width: 100px" @change="handleSrcAnyChange">
+          <el-option :value="false" label="指定IP" />
+          <el-option :value="true" label="any" />
+        </el-select>
+        <el-input v-model="form.src" :placeholder="srcPlaceholder" clearable :disabled="form.srcAny" />
+      </div>
     </el-form-item>
     <el-form-item label="目的IP" prop="dst">
-      <el-input v-model="form.dst" placeholder="例如 10.0.0.1/32" clearable />
+      <div class="ip-input">
+        <el-select v-model="form.dstAny" style="width: 100px" @change="handleDstAnyChange">
+          <el-option :value="false" label="指定IP" />
+          <el-option :value="true" label="any" />
+        </el-select>
+        <el-input v-model="form.dst" :placeholder="dstPlaceholder" clearable :disabled="form.dstAny" />
+      </div>
     </el-form-item>
     <el-form-item label="协议" prop="proto">
       <el-select v-model="form.proto" style="width: 100%">
@@ -44,7 +56,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import type { FormInstance, FormRules } from 'element-plus'
 
-defineProps<{ submitting?: boolean }>()
+const props = withDefaults(defineProps<{ submitting?: boolean; ipVersion?: 4 | 6 }>(), { ipVersion: 4 })
 const emit = defineEmits<{(e: 'submit', payload: any): void}>()
 
 const formRef = ref<FormInstance>()
@@ -52,6 +64,8 @@ const form = reactive({
   allow: 1,
   src: '',
   dst: '',
+  srcAny: false,
+  dstAny: false,
   proto: 0,
   src_port_min: 0,
   src_port_max: 0,
@@ -59,16 +73,47 @@ const form = reactive({
   dst_port_max: 0
 })
 
-const cidrRe = /^(\d{1,3}\.){3}\d{1,3}\/([0-9]|[12]\d|3[0-2])$/
+const cidr4Re = /^(\d{1,3}\.){3}\d{1,3}\/([0-9]|[12]\d|3[0-2])$/
+const cidr6Re = /^[0-9a-fA-F:]+\/([0-9]|[1-9]\d|1[01]\d|12[0-8])$/
 function validateCIDR(_: any, value: string, callback: any) {
   const v = (value || '').trim()
   if (!v) return callback(new Error('必填'))
-  if (!cidrRe.test(v)) return callback(new Error('格式应为 x.x.x.x/0-32'))
-  const [ip] = v.split('/')
-  const parts = ip.split('.').map((x) => Number(x))
-  if (parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return callback(new Error('IP 段应为 0-255'))
+  if (props.ipVersion === 4) {
+    if (!cidr4Re.test(v)) return callback(new Error('格式应为 x.x.x.x/0-32'))
+    const [ip] = v.split('/')
+    const parts = ip.split('.').map((x) => Number(x))
+    if (parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return callback(new Error('IP 段应为 0-255'))
+  } else {
+    if (!cidr6Re.test(v)) return callback(new Error('格式应为 ipv6/0-128'))
+  }
   callback()
 }
+
+function validateIPBothAny(_: any, __: any, callback: any) {
+  if (form.srcAny && form.dstAny) {
+    callback(new Error('源IP和目的IP不能同时为any'))
+  } else {
+    callback()
+  }
+}
+
+function handleSrcAnyChange(val: boolean) {
+  if (val) {
+    form.src = ''
+    formRef.value?.clearValidate(['src'])
+  }
+}
+
+function handleDstAnyChange(val: boolean) {
+  if (val) {
+    form.dst = ''
+    formRef.value?.clearValidate(['dst'])
+  }
+}
+
+const anyCidr = computed(() => (props.ipVersion === 6 ? '::/0' : '0.0.0.0/0'))
+const srcPlaceholder = computed(() => (props.ipVersion === 6 ? '例如 2001:db8::/64' : '例如 192.168.1.0/24'))
+const dstPlaceholder = computed(() => (props.ipVersion === 6 ? '例如 2001:db8:1::/64' : '例如 10.0.0.1/32'))
 
 const portsDisabled = computed(() => form.proto === 0)
 watch(() => form.proto, (p) => {
@@ -84,8 +129,18 @@ watch(() => form.proto, (p) => {
 })
 
 const rules: FormRules = {
-  src: [{ validator: validateCIDR, trigger: 'blur' }],
-  dst: [{ validator: validateCIDR, trigger: 'blur' }],
+  src: [{
+    validator: (_: any, __: any, cb: any) => {
+      if (form.srcAny) return cb()
+      return validateCIDR(_, form.src, cb)
+    }, trigger: 'blur'
+  }],
+  dst: [{
+    validator: (_: any, __: any, cb: any) => {
+      if (form.dstAny) return cb()
+      return validateCIDR(_, form.dst, cb)
+    }, trigger: 'blur'
+  }, { validator: validateIPBothAny, trigger: 'blur' }],
   src_port_min: [{
     validator: (_: any, __: any, cb: any) => {
       if (portsDisabled.value) return cb()
@@ -106,6 +161,8 @@ function reset() {
   form.allow = 1
   form.src = ''
   form.dst = ''
+  form.srcAny = false
+  form.dstAny = false
   form.proto = 0
   form.src_port_min = 0
   form.src_port_max = 0
@@ -117,11 +174,18 @@ function reset() {
 async function submit() {
   const ok = await formRef.value?.validate().catch(() => false)
   if (!ok) return
-  emit('submit', { ...form })
+  const payload = {
+    ...form,
+    src: form.srcAny ? anyCidr.value : form.src,
+    dst: form.dstAny ? anyCidr.value : form.dst
+  }
+  emit('submit', payload)
 }
 </script>
 
 <style scoped>
 .ports { display:flex; align-items:center; gap:8px; width: 100%; }
 .ports__sep { color: #909399; }
+.ip-input { display: flex; gap: 8px; width: 100%; }
+.ip-input .el-input { flex: 1; }
 </style>
