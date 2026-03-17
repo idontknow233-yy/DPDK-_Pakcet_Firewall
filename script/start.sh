@@ -7,46 +7,23 @@ PID_DIR="${LOG_DIR}/pids"
 
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
+for f in "${LOG_DIR}"/*.log; do
+  [[ -e "$f" ]] || continue
+  if ! : >"$f" 2>/dev/null; then
+    echo "[$(timestamp)] 警告: 无法清空日志文件 $f，尝试使用 tr..."
+    if command -v truncate >/dev/null 2>&1; then
+      truncate -s 0 "$f" 2>/dev/null || true
+    else
+      echo -n "" >"$f" 2>/dev/null || true
+    fi
+  fi
+done
+
 START_LOG="${LOG_DIR}/start.log"
 touch "${START_LOG}"
 exec > >(tee -a "${START_LOG}") 2>&1
 
 timestamp() { date +"%F %T"; }
-
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-STDBUF_PREFIX=()
-if have_cmd stdbuf; then
-  STDBUF_PREFIX=(stdbuf -oL -eL)
-fi
-
-find_pid() {
-  local pattern="$1"
-  pgrep -f "${pattern}" 2>/dev/null | head -n 1 || true
-}
-
-port_open() {
-  local host="$1"
-  local port="$2"
-  timeout 0.3 bash -c ">/dev/tcp/${host}/${port}" >/dev/null 2>&1
-}
-
-wait_log_contains() {
-  local name="$1"
-  local logfile="$2"
-  local needle="$3"
-  local i
-  for i in {1..60}; do
-    if grep -Fq "${needle}" "${logfile}" 2>/dev/null; then
-      echo "[$(timestamp)] [${name}] 日志就绪: ${needle}"
-      return 0
-    fi
-    sleep 0.5
-  done
-  echo "[$(timestamp)] [${name}] 等待日志超时: ${needle}"
-  tail -n 120 "${logfile}" || true
-  return 1
-}
 
 run_step() {
   local name="$1"
@@ -63,14 +40,6 @@ start_bg() {
   local logfile="${LOG_DIR}/${name}.log"
   local pidfile="${PID_DIR}/${name}.pid"
   shift
-  local pattern=""
-  if [[ "${1:-}" == "--pattern" ]]; then
-    pattern="${2:-}"
-    shift 2
-  fi
-  if [[ -z "${pattern}" ]]; then
-    pattern="${1:-}"
-  fi
 
   if [[ -f "${pidfile}" ]]; then
     local old_pid
@@ -82,17 +51,9 @@ start_bg() {
     rm -f "${pidfile}"
   fi
 
-  local existing_pid
-  existing_pid="$(find_pid "${pattern}")"
-  if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
-    echo "[$(timestamp)] [${name}] 检测到已在运行 (pid=${existing_pid})"
-    echo "${existing_pid}" >"${pidfile}"
-    return 0
-  fi
-
   echo "[$(timestamp)] [${name}] 启动"
   echo "[$(timestamp)] [${name}] CMD: $*"
-  nohup "${STDBUF_PREFIX[@]}" "$@" >>"${logfile}" 2>&1 &
+  stdbuf -oL -eL nohup "$@" >>"${logfile}" 2>&1 &
   local pid=$!
   echo "${pid}" >"${pidfile}"
 
@@ -134,29 +95,75 @@ run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py -
 run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:02:07.0
 run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:02:08.0
 
-start_bg "dataplane" --pattern "/home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall" /home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall -l 0-3 -n 4 --proc-type=primary -- -p 0x3 -P
+start_bg "dataplane" /home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall -l 0-3 -n 4 --proc-type=primary -- -p 0x3 -P
 
-if port_open "127.0.0.1" "8086"; then
-  echo "[$(timestamp)] [controlplane] 端口已被占用 127.0.0.1:8086"
-fi
-start_bg "controlplane" --pattern "/home/yy/DPDK_Packet_Firewall/build/controlplane/control_plane" /home/yy/DPDK_Packet_Firewall/build/controlplane/control_plane -l 0-3 -n 4 --proc-type=secondary -- --cli-host 0.0.0.0 --cli-port 8086
-wait_tcp "127.0.0.1" "8086" "controlplane"
-wait_log_contains "controlplane" "${LOG_DIR}/controlplane.log" "ACL CLI listening"
+echo "[$(timestamp)] [dataplane] 等待 dataplane 完全初始化..."
+for i in {1..50}; do
+  if grep -q "L2FWD: entering main loop" "${LOG_DIR}/dataplane.log" 2>/dev/null; then
+    echo "[$(timestamp)] [dataplane] 初始化完成"
+    break
+  fi
+  if [[ $i -eq 50 ]]; then
+    echo "[$(timestamp)] [dataplane] 初始化超时"
+    tail -n 50 "${LOG_DIR}/dataplane.log"
+    exit 1
+  fi
+  sleep 0.5
+done
+
+sleep 2
+
+start_bg "controlplane" /home/yy/DPDK_Packet_Firewall/build/controlplane/control_plane -l 0-3 -n 4 --proc-type=secondary -- --cli-host 0.0.0.0 --cli-port 8086
+
+echo "[$(timestamp)] [controlplane] 等待 controlplane 启动..."
+for i in {1..60}; do
+  pid="$(cat "${PID_DIR}/controlplane.pid" 2>/dev/null || echo "")"
+  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" 2>/dev/null; then
+    echo "[$(timestamp)] [controlplane] 进程已退出 (pid=${pid})"
+    echo "[$(timestamp)] [controlplane] ========== 完整日志输出 =========="
+    cat "${LOG_DIR}/controlplane.log" || true
+    echo "[$(timestamp)] [controlplane] ========== 日志结束 =========="
+    exit 1
+  fi
+  
+  if grep -q "ACL CLI listening on 0.0.0.0:8086" "${LOG_DIR}/controlplane.log" 2>/dev/null; then
+    echo "[$(timestamp)] [controlplane] 启动成功"
+    sleep 1
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "[$(timestamp)] [controlplane] 启动后立即崩溃 (pid=${pid})"
+      echo "[$(timestamp)] [controlplane] ========== 完整日志输出 =========="
+      cat "${LOG_DIR}/controlplane.log" || true
+      echo "[$(timestamp)] [controlplane] ========== 日志结束 =========="
+      exit 1
+    fi
+    break
+  fi
+  
+  if [[ $((i % 10)) -eq 0 ]]; then
+    echo "[$(timestamp)] [controlplane] 等待中... (${i}/60)"
+  fi
+  
+  if [[ $i -eq 60 ]]; then
+    echo "[$(timestamp)] [controlplane] 启动超时"
+    echo "[$(timestamp)] [controlplane] ========== 日志最后100行 =========="
+    tail -n 100 "${LOG_DIR}/controlplane.log" || true
+    echo "[$(timestamp)] [controlplane] ========== 日志结束 =========="
+    exit 1
+  fi
+  sleep 0.5
+done
+
+# wait_tcp "127.0.0.1" "8086" "controlplane"
 
 (
   cd /home/yy/DPDK_Packet_Firewall/web/backend
-  if port_open "127.0.0.1" "9000"; then
-    echo "[$(timestamp)] [backend] 端口已被占用 127.0.0.1:9000"
-  fi
-  start_bg "backend" --pattern "go run ./cmd/server" env CLI_HOST=127.0.0.1 CLI_PORT=8086 HTTP_ADDR=:9000 go run ./cmd/server
+  start_bg "backend" env CLI_HOST=127.0.0.1 CLI_PORT=8086 HTTP_ADDR=:9000 go run ./cmd/server
 )
 wait_tcp "127.0.0.1" "9000" "backend"
-wait_log_contains "backend" "${LOG_DIR}/backend.log" "listening :9000"
 
 (
   cd /home/yy/DPDK_Packet_Firewall/web/frontend
-  start_bg "frontend" --pattern "DPDK_Packet_Firewall/web/frontend.*npm run dev" npm run dev
+  start_bg "frontend" npm run dev
 )
-wait_tcp "127.0.0.1" "5173" "frontend"
 
 echo "[$(timestamp)] start.sh: 全部启动完成"

@@ -7,11 +7,44 @@ PID_DIR="${LOG_DIR}/pids"
 
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
+timestamp() { date +"%F %T"; }
+
+echo "[$(timestamp)] stop.sh: 强制清理所有相关进程..."
+
+pkill -9 -f "go run ./cmd/server" || true
+pkill -9 -f "npm run dev" || true
+pkill -9 -f "control_plane" || true
+pkill -9 -f "dpdk_packet_firewall" || true
+
+sleep 2
+
+for f in "${LOG_DIR}"/*.log; do
+  [[ -e "$f" ]] || continue
+  : >"$f" 2>/dev/null || echo -n >"$f" 2>/dev/null || true
+done
+
+for f in "${PID_DIR}"/*.pid; do
+  [[ -e "$f" ]] || continue
+  rm -f "$f"
+done
+
 STOP_LOG="${LOG_DIR}/stop.log"
 touch "${STOP_LOG}"
 exec > >(tee -a "${STOP_LOG}") 2>&1
 
-timestamp() { date +"%F %T"; }
+echo "[$(timestamp)] stop.sh: ROOT_DIR=${ROOT_DIR}"
+
+kill_processes_on_ports() {
+  local ports=("8086" "9000")
+  for port in "${ports[@]}"; do
+    local pids
+    pids="$(lsof -ti:${port} 2>/dev/null || true)"
+    if [[ -n "${pids}" ]]; then
+      echo "[$(timestamp)] 停止占用端口 ${port} 的进程: ${pids}"
+      kill -9 ${pids} 2>/dev/null || true
+    fi
+  done
+}
 
 stop_pid() {
   local name="$1"
@@ -68,7 +101,7 @@ stop_fallback() {
   pkill -TERM -f "${pattern}" 2>/dev/null || true
 }
 
-echo "[$(timestamp)] stop.sh: ROOT_DIR=${ROOT_DIR}"
+kill_processes_on_ports
 
 stop_pid "frontend"
 stop_pid "backend"
