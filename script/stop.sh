@@ -1,53 +1,83 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 脚本所在目录
-SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="${ROOT_DIR}/log"
+PID_DIR="${LOG_DIR}/pids"
 
-echo "=== 停止 DPDK Packet Firewall ==="
+mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
-# 1. 停止前端
-echo "[1/4] 停止前端..."
-if pkill -f "vite" >/dev/null 2>&1; then
-    echo "  - 前端已停止"
-else
-    echo "  - 前端未运行"
-fi
+STOP_LOG="${LOG_DIR}/stop.log"
+touch "${STOP_LOG}"
+exec > >(tee -a "${STOP_LOG}") 2>&1
 
-# 2. 停止后端
-echo "[2/4] 停止后端..."
-if pkill -f "go run ./cmd/server" >/dev/null 2>&1; then
-    echo "  - 后端已停止"
-else
-    # 尝试直接 kill 编译后的二进制 (如果用户直接运行二进制)
-    if pkill -f "dpdk-packet-firewall-web-backend" >/dev/null 2>&1; then
-        echo "  - 后端(二进制)已停止"
+timestamp() { date +"%F %T"; }
+
+stop_pid() {
+  local name="$1"
+  local pidfile="${PID_DIR}/${name}.pid"
+
+  if [[ ! -f "${pidfile}" ]]; then
+    echo "[$(timestamp)] [${name}] pid 文件不存在，跳过 (${pidfile})"
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  if [[ -z "${pid}" ]]; then
+    echo "[$(timestamp)] [${name}] pid 文件为空，删除 pid 文件"
+    rm -f "${pidfile}"
+    return 0
+  fi
+
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    echo "[$(timestamp)] [${name}] 进程不存在 (pid=${pid})，删除 pid 文件"
+    rm -f "${pidfile}"
+    return 0
+  fi
+
+  echo "[$(timestamp)] [${name}] 停止 (pid=${pid})"
+  kill -TERM "${pid}" 2>/dev/null || true
+
+  local i
+  for i in {1..30}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      sleep 0.2
     else
-        echo "  - 后端未运行"
+      echo "[$(timestamp)] [${name}] 已停止"
+      rm -f "${pidfile}"
+      return 0
     fi
-fi
+  done
 
-# 3. 停止控制面
-echo "[3/4] 停止控制面..."
-if sudo pkill -f "control_plane" >/dev/null 2>&1; then
-    echo "  - 控制面已停止"
-else
-    echo "  - 控制面未运行"
-fi
+  echo "[$(timestamp)] [${name}] 超时未退出，强制 kill -KILL (pid=${pid})"
+  kill -KILL "${pid}" 2>/dev/null || true
+  rm -f "${pidfile}"
+}
 
-# 4. 停止数据面
-echo "[4/4] 停止数据面..."
-if sudo pkill -f "dpdk_packet_firewall" >/dev/null 2>&1; then
-    echo "  - 数据面已停止"
-else
-    echo "  - 数据面未运行"
-fi
+stop_fallback() {
+  local label="$1"
+  local pattern="$2"
+  local pids
+  pids="$(pgrep -f "${pattern}" 2>/dev/null || true)"
+  if [[ -z "${pids}" ]]; then
+    echo "[$(timestamp)] [${label}] 未找到匹配进程，跳过"
+    return 0
+  fi
+  echo "[$(timestamp)] [${label}] fallback 停止: ${pids}"
+  pkill -TERM -f "${pattern}" 2>/dev/null || true
+}
 
-# 5. 清理残留
-echo "清理残留进程..."
-# 有时候 pkill -f 可能漏掉某些特定参数启动的进程，这里再次尝试清理
-pkill -f "node" >/dev/null 2>&1 || true
-pkill -f "server" >/dev/null 2>&1 || true
+echo "[$(timestamp)] stop.sh: ROOT_DIR=${ROOT_DIR}"
 
-echo ""
-echo "=== 所有服务已停止 ==="
+stop_pid "frontend"
+stop_pid "backend"
+stop_pid "controlplane"
+stop_pid "dataplane"
+
+stop_fallback "frontend" "/home/yy/DPDK_Packet_Firewall/web/frontend.*(npm|vite)"
+stop_fallback "backend" "/home/yy/DPDK_Packet_Firewall/web/backend.*go run ./cmd/server"
+stop_fallback "controlplane" "/home/yy/DPDK_Packet_Firewall/build/controlplane/control_plane"
+stop_fallback "dataplane" "/home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall"
+
+echo "[$(timestamp)] stop.sh: 完成"

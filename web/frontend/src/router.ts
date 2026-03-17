@@ -6,9 +6,13 @@ import DdosPage from './pages/DdosPage.vue'
 import SessionsPage from './pages/SessionsPage.vue'
 import Sessions6Page from './pages/Sessions6Page.vue'
 import Route6Page from './pages/Route6Page.vue'
+import TopologyPage from './pages/TopologyPage.vue'
+import AttackDemoPage from './pages/AttackDemoPage.vue'
 
 const routes = [
   { path: '/', component: DashboardPage },
+  { path: '/topology', component: TopologyPage },
+  { path: '/attack', component: AttackDemoPage },
   { path: '/acl', component: AclPage },
   { path: '/acl6', component: Acl6Page },
   { path: '/route6', component: Route6Page },

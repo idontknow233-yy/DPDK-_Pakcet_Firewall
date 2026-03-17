@@ -40,7 +40,7 @@
 import { computed, ref } from 'vue'
 import RuleForm from '../components/RuleForm.vue'
 import RuleTable from '../components/RuleTable.vue'
-import { getAclSnapshot, addAclRule, deleteAclRule, clearAcl } from '../services/api'
+import { getAclSnapshot, getAclHits, addAclRule, deleteAclRule, clearAcl } from '../services/api'
 import { ElMessageBox, ElMessage } from 'element-plus'
 
 const version = ref(0)
@@ -60,9 +60,14 @@ async function refresh() {
   loading.value = true
   try {
     const snap = await getAclSnapshot()
+    const hits = await getAclHits().catch(() => null)
     version.value = snap.version
     count.value = snap.count
-    rows.value = mapRows(snap.rules)
+    rows.value = mapRows(snap.rules).map((r: any) => ({
+      ...r,
+      deny_pkts: hits?.pkts?.[r.index] ?? 0,
+      deny_bytes: hits?.bytes?.[r.index] ?? 0
+    }))
     lastUpdated.value = new Date().toLocaleString()
   } catch (e: any) {
     ElMessage.error(e?.message || '获取ACL失败')

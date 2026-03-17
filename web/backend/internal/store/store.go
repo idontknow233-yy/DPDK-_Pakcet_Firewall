@@ -149,7 +149,7 @@ func (s *Store) Add(r Rule) error {
 		return errors.New("bad port range")
 	}
 	created := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`INSERT INTO acl_rules(action,src,dst,proto,src_port_min,src_port_max,dst_port_min,dst_port_max,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+	_, err = s.db.Exec(`INSERT INTO acl_rules(action,src,dst,proto,src_port_min,src_port_max,dst_port_min,dst_port_max,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
 		act, r.Src, r.Dst, r.Proto, r.SrcPortMin, r.SrcPortMax, r.DstPortMin, r.DstPortMax, created)
 	return err
 }

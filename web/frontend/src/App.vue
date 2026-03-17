@@ -7,6 +7,8 @@
       </div>
       <el-menu :collapse="collapsed" router :default-active="route.path" class="app-menu">
         <el-menu-item index="/">Dashboard</el-menu-item>
+        <el-menu-item index="/topology">拓扑/链路</el-menu-item>
+        <el-menu-item index="/attack">攻击演示</el-menu-item>
         <el-menu-item index="/acl">ACL规则</el-menu-item>
         <el-menu-item index="/acl6">IPv6 ACL规则</el-menu-item>
         <el-menu-item index="/route6">IPv6 路由/接口</el-menu-item>

@@ -55,12 +55,15 @@
 #include "acl/acl6.h"
 #include "arp/arp.h"
 #include "ipc/acl_ipc.h"
+#include "ipc/acl_hit_ipc.h"
 #include "ipc/acl6_ipc.h"
+#include "ipc/acl6_hit_ipc.h"
 #include "ipc/session_ipc.h"
 #include "ipc/session6_ipc.h"
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
 #include "ipc/route6_ipc.h"
+#include "ipc/attack_ipc.h"
 #include "nd/nd.h"
 #include "route/route.h"
 #include "route/route6.h"
@@ -154,9 +157,11 @@ static struct acl6_runtime acl6_rt;
 static struct rte_ring *acl_cmd_ring;
 static struct rte_ring *acl_resp_ring;
 static struct acl_shared_cfg *acl_shared_cfg;
+static struct acl_hit_shared_cfg *acl_hit_shared_cfg;
 static struct rte_ring *acl6_cmd_ring;
 static struct rte_ring *acl6_resp_ring;
 static struct acl6_shared_cfg *acl6_shared_cfg;
+static struct acl6_hit_shared_cfg *acl6_hit_shared_cfg;
 static struct session_shared_cfg *session_shared_cfg;
 static struct session6_shared_cfg *session6_shared_cfg;
 static struct portstats_shared_cfg *portstats_shared_cfg;
@@ -164,6 +169,7 @@ static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
+static struct attack_shared_cfg *attack_shared_cfg;
 static uint64_t session_timeout_tsc;
 
 static struct route_table *ipv4_rt;
@@ -208,6 +214,45 @@ static uint32_t rlim_syn_pps;
 static uint32_t rlim_syn_burst;
 static uint32_t rlim_udp_pps;
 static uint32_t rlim_udp_burst;
+
+struct scan4_state {
+	uint64_t window_start_tsc;
+	uint64_t ban_until_tsc;
+	uint64_t port_bits;
+	uint32_t port_cnt;
+};
+
+struct scan6_state {
+	uint64_t window_start_tsc;
+	uint64_t ban_until_tsc;
+	uint64_t port_bits;
+	uint32_t port_cnt;
+};
+
+struct scan_table {
+	struct rte_hash *h;
+	void *states;
+	uint32_t cap;
+	uint32_t key_len;
+};
+
+static struct scan_table scan4_tbls[RTE_MAX_LCORE];
+static struct scan_table scan6_tbls[RTE_MAX_LCORE];
+static rte_atomic64_t attack_syn_cnt[RTE_MAX_LCORE];
+static rte_atomic64_t attack_udp_cnt[RTE_MAX_LCORE];
+static rte_atomic64_t attack_scan_events_cnt[RTE_MAX_LCORE];
+static rte_atomic64_t attack_scan_banned_cnt[RTE_MAX_LCORE];
+static uint32_t attack_top_scan4_ports[RTE_MAX_LCORE];
+static uint32_t attack_top_scan4_ip[RTE_MAX_LCORE];
+static struct rte_ipv6_addr attack_top_scan6_ip[RTE_MAX_LCORE];
+static uint32_t attack_top_scan6_ports[RTE_MAX_LCORE];
+static uint32_t attack_scan_ports_per_sec;
+static uint32_t attack_ban_seconds;
+static uint8_t attack_mitigation_enabled;
+static rte_atomic64_t acl_deny_pkts[RTE_MAX_LCORE][ACL_MAX_RULES];
+static rte_atomic64_t acl_deny_bytes[RTE_MAX_LCORE][ACL_MAX_RULES];
+static rte_atomic64_t acl6_deny_pkts[RTE_MAX_LCORE][ACL6_MAX_RULES];
+static rte_atomic64_t acl6_deny_bytes[RTE_MAX_LCORE][ACL6_MAX_RULES];
 
 static int rlim_table_init(struct rlim_table *t, const char *name, uint32_t cap, uint32_t key_len, int socket_id) {
 	if (!t || !name || cap == 0 || key_len == 0) {
@@ -284,6 +329,147 @@ static inline int rlim_allow(struct rlim_table *t, const void *key, uint64_t now
 	return 1;
 }
 
+static int scan_table_init(struct scan_table *t, const char *name, uint32_t cap, uint32_t key_len, size_t state_size, int socket_id) {
+	if (!t || !name || cap == 0 || key_len == 0 || state_size == 0) {
+		return -1;
+	}
+	memset(t, 0, sizeof(*t));
+	t->cap = cap;
+	t->key_len = key_len;
+	t->states = rte_zmalloc_socket(NULL, state_size * cap, 0, socket_id);
+	if (!t->states) {
+		return -1;
+	}
+	struct rte_hash_parameters hp;
+	memset(&hp, 0, sizeof(hp));
+	hp.name = name;
+	hp.entries = cap;
+	hp.key_len = key_len;
+	hp.hash_func = rte_jhash;
+	hp.hash_func_init_val = 0;
+	hp.socket_id = socket_id;
+	t->h = rte_hash_create(&hp);
+	if (!t->h) {
+		rte_free(t->states);
+		memset(t, 0, sizeof(*t));
+		return -1;
+	}
+	return 0;
+}
+
+static void scan_table_free(struct scan_table *t) {
+	if (!t) {
+		return;
+	}
+	if (t->h) {
+		rte_hash_free(t->h);
+	}
+	if (t->states) {
+		rte_free(t->states);
+	}
+	memset(t, 0, sizeof(*t));
+}
+
+static inline int scan4_is_banned(unsigned lcore_id, uint32_t src_ip, uint64_t now_tsc) {
+	struct scan_table *t = &scan4_tbls[lcore_id];
+	if (!t->h || !t->states) {
+		return 0;
+	}
+	int32_t pos = rte_hash_lookup(t->h, &src_ip);
+	if (pos < 0) {
+		return 0;
+	}
+	struct scan4_state *st = &((struct scan4_state *)t->states)[(uint32_t)pos];
+	return st->ban_until_tsc && now_tsc < st->ban_until_tsc;
+}
+
+static inline int scan6_is_banned(unsigned lcore_id, const struct rte_ipv6_addr *src_ip6, uint64_t now_tsc) {
+	struct scan_table *t = &scan6_tbls[lcore_id];
+	if (!t->h || !t->states || !src_ip6) {
+		return 0;
+	}
+	int32_t pos = rte_hash_lookup(t->h, src_ip6);
+	if (pos < 0) {
+		return 0;
+	}
+	struct scan6_state *st = &((struct scan6_state *)t->states)[(uint32_t)pos];
+	return st->ban_until_tsc && now_tsc < st->ban_until_tsc;
+}
+
+static inline void scan4_track_syn(unsigned lcore_id, uint32_t src_ip, uint16_t dst_port, uint64_t now_tsc, uint64_t hz) {
+	struct scan_table *t = &scan4_tbls[lcore_id];
+	if (!t->h || !t->states || hz == 0) {
+		return;
+	}
+	int32_t pos = rte_hash_lookup(t->h, &src_ip);
+	if (pos < 0) {
+		pos = rte_hash_add_key(t->h, &src_ip);
+		if (pos < 0) {
+			return;
+		}
+	}
+	struct scan4_state *st = &((struct scan4_state *)t->states)[(uint32_t)pos];
+	if (st->ban_until_tsc && now_tsc < st->ban_until_tsc) {
+		return;
+	}
+	if (st->window_start_tsc == 0 || now_tsc - st->window_start_tsc >= hz) {
+		st->window_start_tsc = now_tsc;
+		st->port_bits = 0;
+		st->port_cnt = 0;
+	}
+	uint64_t bit = 1ULL << (dst_port & 63);
+	if ((st->port_bits & bit) == 0) {
+		st->port_bits |= bit;
+		st->port_cnt++;
+		if (st->port_cnt > attack_top_scan4_ports[lcore_id]) {
+			attack_top_scan4_ports[lcore_id] = st->port_cnt;
+			attack_top_scan4_ip[lcore_id] = src_ip;
+		}
+		if (attack_mitigation_enabled && attack_scan_ports_per_sec && st->port_cnt >= attack_scan_ports_per_sec) {
+			st->ban_until_tsc = now_tsc + (uint64_t)attack_ban_seconds * hz;
+			rte_atomic64_inc(&attack_scan_events_cnt[lcore_id]);
+			rte_atomic64_inc(&attack_scan_banned_cnt[lcore_id]);
+		}
+	}
+}
+
+static inline void scan6_track_syn(unsigned lcore_id, const struct rte_ipv6_addr *src_ip6, uint16_t dst_port, uint64_t now_tsc, uint64_t hz) {
+	struct scan_table *t = &scan6_tbls[lcore_id];
+	if (!t->h || !t->states || !src_ip6 || hz == 0) {
+		return;
+	}
+	int32_t pos = rte_hash_lookup(t->h, src_ip6);
+	if (pos < 0) {
+		pos = rte_hash_add_key(t->h, src_ip6);
+		if (pos < 0) {
+			return;
+		}
+	}
+	struct scan6_state *st = &((struct scan6_state *)t->states)[(uint32_t)pos];
+	if (st->ban_until_tsc && now_tsc < st->ban_until_tsc) {
+		return;
+	}
+	if (st->window_start_tsc == 0 || now_tsc - st->window_start_tsc >= hz) {
+		st->window_start_tsc = now_tsc;
+		st->port_bits = 0;
+		st->port_cnt = 0;
+	}
+	uint64_t bit = 1ULL << (dst_port & 63);
+	if ((st->port_bits & bit) == 0) {
+		st->port_bits |= bit;
+		st->port_cnt++;
+		if (st->port_cnt > attack_top_scan6_ports[lcore_id]) {
+			attack_top_scan6_ports[lcore_id] = st->port_cnt;
+			attack_top_scan6_ip[lcore_id] = *src_ip6;
+		}
+		if (attack_mitigation_enabled && attack_scan_ports_per_sec && st->port_cnt >= attack_scan_ports_per_sec) {
+			st->ban_until_tsc = now_tsc + (uint64_t)attack_ban_seconds * hz;
+			rte_atomic64_inc(&attack_scan_events_cnt[lcore_id]);
+			rte_atomic64_inc(&attack_scan_banned_cnt[lcore_id]);
+		}
+	}
+}
+
 static struct session_table *session_table_for_lcore(unsigned lcore_id) {
 	if (lcore_id >= RTE_MAX_LCORE || !session_table_inited[lcore_id]) {
 		return NULL;
@@ -315,6 +501,13 @@ static int portstats_shared_sync(void) {
 		portstats_shared_cfg->ports[p].rx = port_statistics[p].rx;
 		portstats_shared_cfg->ports[p].tx = port_statistics[p].tx;
 		portstats_shared_cfg->ports[p].dropped = port_statistics[p].dropped;
+		struct rte_eth_link link;
+		memset(&link, 0, sizeof(link));
+		rte_eth_link_get_nowait(p, &link);
+		portstats_shared_cfg->ports[p].link_up = (uint8_t)link.link_status;
+		portstats_shared_cfg->ports[p].link_speed = (uint32_t)link.link_speed;
+		portstats_shared_cfg->ports[p].link_duplex = (uint8_t)link.link_duplex;
+		memcpy(portstats_shared_cfg->ports[p].mac, &l2fwd_ports_eth_addr[p], RTE_ETHER_ADDR_LEN);
 	}
 	rte_wmb();
 	uint64_t v = rte_atomic64_read(&portstats_shared_cfg->version);
@@ -585,6 +778,49 @@ static int route6_ipc_init(void) {
 	return 0;
 }
 
+static int attack_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(ATTACK_SHARED_NAME, sizeof(struct attack_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	attack_shared_cfg = mz->addr;
+	memset(attack_shared_cfg, 0, sizeof(*attack_shared_cfg));
+	rte_atomic64_init(&attack_shared_cfg->version);
+	attack_shared_cfg->scan_ports_per_sec = 50;
+	attack_shared_cfg->ban_seconds = 60;
+	attack_shared_cfg->mitigation_enabled = 0;
+	rte_wmb();
+	rte_atomic64_set(&attack_shared_cfg->version, 1);
+	return 0;
+}
+
+static int acl_hit_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(ACL_HIT_SHARED_NAME, sizeof(struct acl_hit_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	acl_hit_shared_cfg = mz->addr;
+	memset(acl_hit_shared_cfg, 0, sizeof(*acl_hit_shared_cfg));
+	rte_atomic64_init(&acl_hit_shared_cfg->version);
+	rte_atomic64_set(&acl_hit_shared_cfg->version, 1);
+	return 0;
+}
+
+static int acl6_hit_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(ACL6_HIT_SHARED_NAME, sizeof(struct acl6_hit_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	acl6_hit_shared_cfg = mz->addr;
+	memset(acl6_hit_shared_cfg, 0, sizeof(*acl6_hit_shared_cfg));
+	rte_atomic64_init(&acl6_hit_shared_cfg->version);
+	rte_atomic64_set(&acl6_hit_shared_cfg->version, 1);
+	return 0;
+}
+
 static int rlim_ipc_init(void) {
 	const struct rte_memzone *mz = rte_memzone_reserve(RLIM_SHARED_NAME, sizeof(struct rlim_shared_cfg),
 		rte_socket_id(), 0);
@@ -654,6 +890,98 @@ static void rlim_apply_shared_cfg(void) {
 			rlim_inited[lcore_id] = 1;
 		}
 	}
+}
+
+static void attack_apply_shared_cfg(void) {
+	if (!attack_shared_cfg) {
+		return;
+	}
+	static uint64_t last_v;
+	uint64_t v1 = rte_atomic64_read(&attack_shared_cfg->version);
+	if (v1 == 0 || v1 == last_v) {
+		return;
+	}
+	uint32_t scan_ports = attack_shared_cfg->scan_ports_per_sec;
+	uint32_t ban_sec = attack_shared_cfg->ban_seconds;
+	uint8_t mit = attack_shared_cfg->mitigation_enabled;
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&attack_shared_cfg->version);
+	if (v2 != v1) {
+		return;
+	}
+	last_v = v2;
+	attack_scan_ports_per_sec = scan_ports ? scan_ports : 50;
+	attack_ban_seconds = ban_sec ? ban_sec : 60;
+	attack_mitigation_enabled = mit ? 1 : 0;
+}
+
+static void attack_stats_sync(uint64_t now_tsc) {
+	if (!attack_shared_cfg) {
+		return;
+	}
+	static uint64_t last_tsc;
+	uint64_t hz = rte_get_timer_hz();
+	if (!hz) {
+		return;
+	}
+	if (last_tsc == 0) {
+		last_tsc = now_tsc;
+		return;
+	}
+	if (now_tsc - last_tsc < hz) {
+		return;
+	}
+	uint64_t syn = 0;
+	uint64_t udp = 0;
+	uint64_t scan_events = 0;
+	uint64_t scan_banned = 0;
+	uint32_t top4_ports = 0;
+	uint32_t top4_ip = 0;
+	uint32_t top6_ports = 0;
+	struct rte_ipv6_addr top6_ip = RTE_IPV6_ADDR_UNSPEC;
+
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		uint64_t v;
+		v = rte_atomic64_read(&attack_syn_cnt[lcore_id]);
+		syn += v;
+		rte_atomic64_set(&attack_syn_cnt[lcore_id], 0);
+		v = rte_atomic64_read(&attack_udp_cnt[lcore_id]);
+		udp += v;
+		rte_atomic64_set(&attack_udp_cnt[lcore_id], 0);
+		v = rte_atomic64_read(&attack_scan_events_cnt[lcore_id]);
+		scan_events += v;
+		rte_atomic64_set(&attack_scan_events_cnt[lcore_id], 0);
+		v = rte_atomic64_read(&attack_scan_banned_cnt[lcore_id]);
+		scan_banned += v;
+		rte_atomic64_set(&attack_scan_banned_cnt[lcore_id], 0);
+
+		if (attack_top_scan4_ports[lcore_id] > top4_ports) {
+			top4_ports = attack_top_scan4_ports[lcore_id];
+			top4_ip = attack_top_scan4_ip[lcore_id];
+		}
+		if (attack_top_scan6_ports[lcore_id] > top6_ports) {
+			top6_ports = attack_top_scan6_ports[lcore_id];
+			top6_ip = attack_top_scan6_ip[lcore_id];
+		}
+		attack_top_scan4_ports[lcore_id] = 0;
+		attack_top_scan4_ip[lcore_id] = 0;
+		attack_top_scan6_ports[lcore_id] = 0;
+		memset(&attack_top_scan6_ip[lcore_id], 0, sizeof(attack_top_scan6_ip[lcore_id]));
+	}
+
+	attack_shared_cfg->syn_pps = syn > UINT32_MAX ? UINT32_MAX : (uint32_t)syn;
+	attack_shared_cfg->udp_pps = udp > UINT32_MAX ? UINT32_MAX : (uint32_t)udp;
+	attack_shared_cfg->scan_events = attack_shared_cfg->scan_events + (uint32_t)(scan_events > UINT32_MAX ? UINT32_MAX : scan_events);
+	attack_shared_cfg->scan_banned = attack_shared_cfg->scan_banned + (uint32_t)(scan_banned > UINT32_MAX ? UINT32_MAX : scan_banned);
+	attack_shared_cfg->top_scan4_ip = top4_ip;
+	attack_shared_cfg->top_scan4_ports = top4_ports;
+	attack_shared_cfg->top_scan6_ip = top6_ip;
+	attack_shared_cfg->top_scan6_ports = top6_ports;
+	rte_wmb();
+	uint64_t vcur = rte_atomic64_read(&attack_shared_cfg->version);
+	rte_atomic64_set(&attack_shared_cfg->version, vcur + 1);
+	last_tsc = now_tsc;
 }
 
 static void denylog_add(uint64_t tsc, uint16_t in_port, uint32_t src_ip, uint32_t dst_ip,
@@ -753,6 +1081,92 @@ static int session6_shared_sync(uint64_t now_tsc) {
 	rte_wmb();
 	uint64_t v = rte_atomic64_read(&session6_shared_cfg->version);
 	rte_atomic64_set(&session6_shared_cfg->version, v + 1);
+	return 0;
+}
+
+static void acl_hit_reset_all(void) {
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		for (uint32_t i = 0; i < ACL_MAX_RULES; i++) {
+			rte_atomic64_set(&acl_deny_pkts[lcore_id][i], 0);
+			rte_atomic64_set(&acl_deny_bytes[lcore_id][i], 0);
+		}
+	}
+}
+
+static void acl6_hit_reset_all(void) {
+	unsigned lcore_id;
+	RTE_LCORE_FOREACH(lcore_id) {
+		for (uint32_t i = 0; i < ACL6_MAX_RULES; i++) {
+			rte_atomic64_set(&acl6_deny_pkts[lcore_id][i], 0);
+			rte_atomic64_set(&acl6_deny_bytes[lcore_id][i], 0);
+		}
+	}
+}
+
+static int acl_hit_shared_sync(void) {
+	if (!acl_hit_shared_cfg) {
+		return -1;
+	}
+	static uint64_t last_rule_ver;
+	uint64_t rv = rte_atomic64_read(&acl_rt.version);
+	if (last_rule_ver != 0 && rv != last_rule_ver) {
+		acl_hit_reset_all();
+	}
+	last_rule_ver = rv;
+	uint32_t count = acl_count(acl_runtime_active_ctx());
+	if (count > ACL_MAX_RULES) {
+		count = ACL_MAX_RULES;
+	}
+	acl_hit_shared_cfg->rule_version = rv;
+	acl_hit_shared_cfg->count = count;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t pk = 0;
+		uint64_t by = 0;
+		unsigned lcore_id;
+		RTE_LCORE_FOREACH(lcore_id) {
+			pk += rte_atomic64_read(&acl_deny_pkts[lcore_id][i]);
+			by += rte_atomic64_read(&acl_deny_bytes[lcore_id][i]);
+		}
+		acl_hit_shared_cfg->deny_pkts[i] = pk;
+		acl_hit_shared_cfg->deny_bytes[i] = by;
+	}
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&acl_hit_shared_cfg->version);
+	rte_atomic64_set(&acl_hit_shared_cfg->version, v + 1);
+	return 0;
+}
+
+static int acl6_hit_shared_sync(void) {
+	if (!acl6_hit_shared_cfg) {
+		return -1;
+	}
+	static uint64_t last_rule_ver;
+	uint64_t rv = rte_atomic64_read(&acl6_rt.version);
+	if (last_rule_ver != 0 && rv != last_rule_ver) {
+		acl6_hit_reset_all();
+	}
+	last_rule_ver = rv;
+	uint32_t count = acl6_count(acl6_runtime_active_ctx());
+	if (count > ACL6_MAX_RULES) {
+		count = ACL6_MAX_RULES;
+	}
+	acl6_hit_shared_cfg->rule_version = rv;
+	acl6_hit_shared_cfg->count = count;
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t pk = 0;
+		uint64_t by = 0;
+		unsigned lcore_id;
+		RTE_LCORE_FOREACH(lcore_id) {
+			pk += rte_atomic64_read(&acl6_deny_pkts[lcore_id][i]);
+			by += rte_atomic64_read(&acl6_deny_bytes[lcore_id][i]);
+		}
+		acl6_hit_shared_cfg->deny_pkts[i] = pk;
+		acl6_hit_shared_cfg->deny_bytes[i] = by;
+	}
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&acl6_hit_shared_cfg->version);
+	rte_atomic64_set(&acl6_hit_shared_cfg->version, v + 1);
 	return 0;
 }
 
@@ -1232,17 +1646,38 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			if (pkt_len >= ip_offset + ihl) {
 				l4_hdr = (char *)ip + ihl;
 			}
+			unsigned lcore_id = rte_lcore_id();
+			uint64_t now = rte_get_timer_cycles();
+			uint64_t hz = rte_get_timer_hz();
+			uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
+			if (attack_mitigation_enabled && lcore_id < RTE_MAX_LCORE && scan4_is_banned(lcore_id, src_ip, now)) {
+				rte_pktmbuf_free(m);
+				port_statistics[portid].dropped++;
+				return;
+			}
+			if (l4_hdr && ip->next_proto_id == IPPROTO_TCP) {
+				const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+				uint8_t f = tcp->tcp_flags;
+				if ((f & 0x02) && !(f & 0x10)) {
+					if (lcore_id < RTE_MAX_LCORE) {
+						rte_atomic64_inc(&attack_syn_cnt[lcore_id]);
+					}
+					if (lcore_id < RTE_MAX_LCORE) {
+						scan4_track_syn(lcore_id, src_ip, rte_be_to_cpu_16(tcp->dst_port), now, hz);
+					}
+				}
+			} else if (l4_hdr && ip->next_proto_id == IPPROTO_UDP) {
+				if (lcore_id < RTE_MAX_LCORE) {
+					rte_atomic64_inc(&attack_udp_cnt[lcore_id]);
+				}
+			}
 			if (rlim_syn_pps || rlim_udp_pps) {
-				unsigned lcore_id = rte_lcore_id();
 				struct rlim_table *syn_t = NULL;
 				struct rlim_table *udp_t = NULL;
 				if (lcore_id < RTE_MAX_LCORE && rlim_inited[lcore_id]) {
 					syn_t = &rlim_syn_tbls[lcore_id];
 					udp_t = &rlim_udp_tbls[lcore_id];
 				}
-				uint64_t now = rte_get_timer_cycles();
-				uint64_t hz = rte_get_timer_hz();
-				uint32_t src_ip = rte_be_to_cpu_32(ip->src_addr);
 				if (l4_hdr && ip->next_proto_id == IPPROTO_TCP && rlim_syn_pps) {
 					const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
 					uint8_t f = tcp->tcp_flags;
@@ -1263,6 +1698,10 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			}
 			uint32_t deny_rule_index = UINT32_MAX;
 			if (!acl_check_ipv4(acl_runtime_active_ctx(), ip, l4_hdr, &deny_rule_index)) {
+				if (lcore_id < RTE_MAX_LCORE && deny_rule_index < ACL_MAX_RULES) {
+					rte_atomic64_inc(&acl_deny_pkts[lcore_id][deny_rule_index]);
+					(void)rte_atomic64_add_return(&acl_deny_bytes[lcore_id][deny_rule_index], rte_pktmbuf_pkt_len(m));
+				}
 				uint16_t src_port = 0;
 				uint16_t dst_port = 0;
 				if (l4_hdr && (ip->next_proto_id == IPPROTO_TCP || ip->next_proto_id == IPPROTO_UDP)) {
@@ -1392,6 +1831,29 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 				proto = next;
 			}
 
+			unsigned lcore_id = rte_lcore_id();
+			uint64_t now = rte_get_timer_cycles();
+			uint64_t hz = rte_get_timer_hz();
+			if (attack_mitigation_enabled && lcore_id < RTE_MAX_LCORE && scan6_is_banned(lcore_id, &ip6->src_addr, now)) {
+				rte_pktmbuf_free(m);
+				port_statistics[portid].dropped++;
+				return;
+			}
+			if (l4_hdr && proto == IPPROTO_TCP) {
+				const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
+				uint8_t f = tcp->tcp_flags;
+				if ((f & 0x02) && !(f & 0x10)) {
+					if (lcore_id < RTE_MAX_LCORE) {
+						rte_atomic64_inc(&attack_syn_cnt[lcore_id]);
+						scan6_track_syn(lcore_id, &ip6->src_addr, rte_be_to_cpu_16(tcp->dst_port), now, hz);
+					}
+				}
+			} else if (l4_hdr && proto == IPPROTO_UDP) {
+				if (lcore_id < RTE_MAX_LCORE) {
+					rte_atomic64_inc(&attack_udp_cnt[lcore_id]);
+				}
+			}
+
 			if (rt6 && nd_tbl && l4_hdr && proto == IPPROTO_ICMPV6) {
 				uint16_t txp = 0;
 				int send_reply = nd_process_packet(nd_tbl, m, (uint16_t)portid, if6, l2fwd_ports_eth_addr,
@@ -1411,6 +1873,10 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			if (rt6) {
 				uint32_t deny_rule_index = UINT32_MAX;
 				if (!acl6_check_ipv6(acl6_runtime_active_ctx(), ip6, l4_hdr, &deny_rule_index)) {
+					if (lcore_id < RTE_MAX_LCORE && deny_rule_index < ACL6_MAX_RULES) {
+						rte_atomic64_inc(&acl6_deny_pkts[lcore_id][deny_rule_index]);
+						(void)rte_atomic64_add_return(&acl6_deny_bytes[lcore_id][deny_rule_index], rte_pktmbuf_pkt_len(m));
+					}
 					uint16_t src_port = 0;
 					uint16_t dst_port = 0;
 					if (l4_hdr && (proto == IPPROTO_TCP || proto == IPPROTO_UDP)) {
@@ -1451,15 +1917,12 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 			}
 
 			if (rlim_syn_pps || rlim_udp_pps) {
-				unsigned lcore_id = rte_lcore_id();
 				struct rlim_table *syn_t = NULL;
 				struct rlim_table *udp_t = NULL;
 				if (lcore_id < RTE_MAX_LCORE && rlim_inited[lcore_id]) {
 					syn_t = &rlim6_syn_tbls[lcore_id];
 					udp_t = &rlim6_udp_tbls[lcore_id];
 				}
-				uint64_t now = rte_get_timer_cycles();
-				uint64_t hz = rte_get_timer_hz();
 				const void *src_key = &ip6->src_addr;
 				if (l4_hdr && proto == IPPROTO_TCP && rlim_syn_pps) {
 					const struct rte_tcp_hdr *tcp = (const struct rte_tcp_hdr *)l4_hdr;
@@ -1584,6 +2047,11 @@ l2fwd_main_loop(void)
  
 		/* Drains TX queue in its main loop. 8< */
 		cur_tsc = rte_rdtsc();
+		if (lcore_id == rte_get_main_lcore()) {
+			uint64_t now = rte_get_timer_cycles();
+			attack_apply_shared_cfg();
+			attack_stats_sync(now);
+		}
  
 		/*
 		 * TX burst queue drain
@@ -1622,6 +2090,8 @@ l2fwd_main_loop(void)
 						session6_expire_all(now);
 						session6_shared_sync(now);
 						portstats_shared_sync();
+						acl_hit_shared_sync();
+						acl6_hit_shared_sync();
 						print_stats();
 						/* reset the timer */
 						timer_tsc = 0;
@@ -2391,6 +2861,29 @@ main(int argc, char **argv)
 	ipv6_rt_tbls[0] = NULL;
 	ipv6_rt_tbls[1] = NULL;
 	ipv6_rt_reclaim = NULL;
+	attack_scan_ports_per_sec = 50;
+	attack_ban_seconds = 60;
+	attack_mitigation_enabled = 0;
+	for (unsigned i = 0; i < RTE_MAX_LCORE; i++) {
+		memset(&scan4_tbls[i], 0, sizeof(scan4_tbls[i]));
+		memset(&scan6_tbls[i], 0, sizeof(scan6_tbls[i]));
+		rte_atomic64_init(&attack_syn_cnt[i]);
+		rte_atomic64_init(&attack_udp_cnt[i]);
+		rte_atomic64_init(&attack_scan_events_cnt[i]);
+		rte_atomic64_init(&attack_scan_banned_cnt[i]);
+		attack_top_scan4_ports[i] = 0;
+		attack_top_scan4_ip[i] = 0;
+		attack_top_scan6_ports[i] = 0;
+		memset(&attack_top_scan6_ip[i], 0, sizeof(attack_top_scan6_ip[i]));
+		for (unsigned j = 0; j < ACL_MAX_RULES; j++) {
+			rte_atomic64_init(&acl_deny_pkts[i][j]);
+			rte_atomic64_init(&acl_deny_bytes[i][j]);
+		}
+		for (unsigned j = 0; j < ACL6_MAX_RULES; j++) {
+			rte_atomic64_init(&acl6_deny_pkts[i][j]);
+			rte_atomic64_init(&acl6_deny_bytes[i][j]);
+		}
+	}
  
 	/* parse application arguments (after the EAL ones) */
 	ret = l2fwd_parse_args(argc, argv);
@@ -2573,6 +3066,12 @@ main(int argc, char **argv)
 		if (session6_table_init(&session6_tables[lcore_id], name, 65536, rte_socket_id()) != 0)
 			rte_exit(EXIT_FAILURE, "Cannot init session6 table for lcore %u\n", lcore_id);
 		session6_table_inited[lcore_id] = 1;
+		snprintf(name, sizeof(name), "scan4_%u", lcore_id);
+		if (scan_table_init(&scan4_tbls[lcore_id], name, 32768, sizeof(uint32_t), sizeof(struct scan4_state), rte_socket_id()) != 0)
+			rte_exit(EXIT_FAILURE, "Cannot init scan4 table for lcore %u\n", lcore_id);
+		snprintf(name, sizeof(name), "scan6_%u", lcore_id);
+		if (scan_table_init(&scan6_tbls[lcore_id], name, 32768, sizeof(struct rte_ipv6_addr), sizeof(struct scan6_state), rte_socket_id()) != 0)
+			rte_exit(EXIT_FAILURE, "Cannot init scan6 table for lcore %u\n", lcore_id);
 	}
 	if (rlim_syn_pps || rlim_udp_pps) {
 		RTE_LCORE_FOREACH(lcore_id) {
@@ -2608,6 +3107,12 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Cannot init denylog6 IPC\n");
 	if (route6_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init route6 IPC\n");
+	if (attack_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init attack IPC\n");
+	if (acl_hit_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init acl hit IPC\n");
+	if (acl6_hit_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init acl6 hit IPC\n");
 	if (rlim_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init rlim IPC\n");
 	if (pthread_create(&acl_ctrl_thread, NULL, acl_ctrl_thread_main, NULL) != 0)
@@ -2794,6 +3299,8 @@ main(int argc, char **argv)
 			session6_table_free(&session6_tables[lcore_id]);
 			session6_table_inited[lcore_id] = 0;
 		}
+		scan_table_free(&scan4_tbls[lcore_id]);
+		scan_table_free(&scan6_tbls[lcore_id]);
 		if (rlim_inited[lcore_id]) {
 			rlim_table_free(&rlim_syn_tbls[lcore_id]);
 			rlim_table_free(&rlim_udp_tbls[lcore_id]);

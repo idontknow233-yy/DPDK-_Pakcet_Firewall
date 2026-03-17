@@ -19,6 +19,12 @@ struct portstats_item {
 	uint64_t rx;
 	uint64_t tx;
 	uint64_t dropped;
+	uint32_t link_speed;
+	uint8_t link_up;
+	uint8_t link_duplex;
+	uint16_t reserved;
+	uint8_t mac[RTE_ETHER_ADDR_LEN];
+	uint8_t reserved2[2];
 };
 
 struct portstats_shared_cfg {

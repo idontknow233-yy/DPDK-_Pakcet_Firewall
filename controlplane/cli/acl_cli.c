@@ -28,20 +28,25 @@
 #include "acl/acl.h"
 #include "acl/acl6.h"
 #include "ipc/acl_ipc.h"
+#include "ipc/acl_hit_ipc.h"
 #include "ipc/acl6_ipc.h"
+#include "ipc/acl6_hit_ipc.h"
 #include "ipc/session_ipc.h"
 #include "ipc/session6_ipc.h"
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
 #include "ipc/route6_ipc.h"
+#include "ipc/attack_ipc.h"
 
 static volatile sig_atomic_t force_quit;
 static struct rte_ring *acl_cmd_ring;
 static struct rte_ring *acl_resp_ring;
 static struct acl_shared_cfg *acl_shared_cfg;
+static struct acl_hit_shared_cfg *acl_hit_shared_cfg;
 static struct rte_ring *acl6_cmd_ring;
 static struct rte_ring *acl6_resp_ring;
 static struct acl6_shared_cfg *acl6_shared_cfg;
+static struct acl6_hit_shared_cfg *acl6_hit_shared_cfg;
 static struct session_shared_cfg *session_shared_cfg;
 static struct session6_shared_cfg *session6_shared_cfg;
 static struct portstats_shared_cfg *portstats_shared_cfg;
@@ -49,6 +54,7 @@ static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
+static struct attack_shared_cfg *attack_shared_cfg;
 static const char *cli_host = "0.0.0.0";
 static uint16_t cli_port = 8086;
 static uint32_t cmd_seq;
@@ -92,6 +98,16 @@ struct cmd_acl_clear_result {
 struct cmd_acl_list_result {
 	cmdline_fixed_string_t acl;
 	cmdline_fixed_string_t list;
+};
+
+struct cmd_acl_hits_result {
+	cmdline_fixed_string_t acl;
+	cmdline_fixed_string_t hits;
+};
+
+struct cmd_acl6_hits_result {
+	cmdline_fixed_string_t acl6;
+	cmdline_fixed_string_t hits;
 };
 
 struct cmd_acl6_add_result {
@@ -196,6 +212,19 @@ struct cmd_route6_add_result {
 	cmdline_fixed_string_t dst;
 	cmdline_fixed_string_t nh;
 	uint32_t port;
+};
+
+struct cmd_attack_show_result {
+	cmdline_fixed_string_t attack;
+	cmdline_fixed_string_t show;
+};
+
+struct cmd_attack_set_result {
+	cmdline_fixed_string_t attack;
+	cmdline_fixed_string_t set;
+	uint32_t mitigation;
+	uint32_t scan_ports_sec;
+	uint32_t ban_sec;
 };
 
 struct cmd_ddos_show_result {
@@ -501,6 +530,62 @@ static void cmd_acl_list_parsed(void *parsed_result, struct cmdline *cl, void *d
 	}
 }
 
+static void cmd_acl_hits_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)parsed_result;
+	(void)data;
+	if (!acl_hit_shared_cfg) {
+		cmdline_printf(cl, "ACLHITS: count=0 rule_version=0 (version 0)\n");
+		return;
+	}
+	uint64_t v1 = rte_atomic64_read(&acl_hit_shared_cfg->version);
+	uint32_t count = acl_hit_shared_cfg->count;
+	uint64_t rv = acl_hit_shared_cfg->rule_version;
+	uint64_t pkts[ACL_MAX_RULES];
+	uint64_t bytes[ACL_MAX_RULES];
+	if (count > ACL_MAX_RULES) {
+		count = ACL_MAX_RULES;
+	}
+	memcpy(pkts, acl_hit_shared_cfg->deny_pkts, sizeof(pkts));
+	memcpy(bytes, acl_hit_shared_cfg->deny_bytes, sizeof(bytes));
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&acl_hit_shared_cfg->version);
+	if (v1 != v2) {
+		v1 = v2;
+	}
+	cmdline_printf(cl, "ACLHITS: count=%u rule_version=%" PRIu64 " (version %" PRIu64 ")\n", count, rv, v1);
+	for (uint32_t i = 0; i < count; i++) {
+		cmdline_printf(cl, "%u pkts=%" PRIu64 " bytes=%" PRIu64 "\n", i, pkts[i], bytes[i]);
+	}
+}
+
+static void cmd_acl6_hits_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)parsed_result;
+	(void)data;
+	if (!acl6_hit_shared_cfg) {
+		cmdline_printf(cl, "ACL6HITS: count=0 rule_version=0 (version 0)\n");
+		return;
+	}
+	uint64_t v1 = rte_atomic64_read(&acl6_hit_shared_cfg->version);
+	uint32_t count = acl6_hit_shared_cfg->count;
+	uint64_t rv = acl6_hit_shared_cfg->rule_version;
+	uint64_t pkts[ACL6_MAX_RULES];
+	uint64_t bytes[ACL6_MAX_RULES];
+	if (count > ACL6_MAX_RULES) {
+		count = ACL6_MAX_RULES;
+	}
+	memcpy(pkts, acl6_hit_shared_cfg->deny_pkts, sizeof(pkts));
+	memcpy(bytes, acl6_hit_shared_cfg->deny_bytes, sizeof(bytes));
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&acl6_hit_shared_cfg->version);
+	if (v1 != v2) {
+		v1 = v2;
+	}
+	cmdline_printf(cl, "ACL6HITS: count=%u rule_version=%" PRIu64 " (version %" PRIu64 ")\n", count, rv, v1);
+	for (uint32_t i = 0; i < count; i++) {
+		cmdline_printf(cl, "%u pkts=%" PRIu64 " bytes=%" PRIu64 "\n", i, pkts[i], bytes[i]);
+	}
+}
+
 static int read_shared_rules6(struct acl6_rule *rules, uint32_t *count, uint64_t *version, uint64_t target_version) {
 	if (!acl6_shared_cfg || !rules || !count || !version) {
 		return -1;
@@ -785,8 +870,12 @@ static void cmd_port_stats_parsed(void *parsed_result, struct cmdline *cl, void 
 		if ((mask & (1u << p)) == 0) {
 			continue;
 		}
-		cmdline_printf(cl, "port=%u rx=%" PRIu64 " tx=%" PRIu64 " dropped=%" PRIu64 "\n",
-			p, ports[p].rx, ports[p].tx, ports[p].dropped);
+		cmdline_printf(cl, "port=%u rx=%" PRIu64 " tx=%" PRIu64 " dropped=%" PRIu64 " link=%s speed=%u duplex=%s mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+			p, ports[p].rx, ports[p].tx, ports[p].dropped,
+			ports[p].link_up ? "up" : "down",
+			ports[p].link_speed,
+			ports[p].link_duplex ? "full" : "half",
+			ports[p].mac[0], ports[p].mac[1], ports[p].mac[2], ports[p].mac[3], ports[p].mac[4], ports[p].mac[5]);
 	}
 }
 
@@ -1101,6 +1190,73 @@ static void cmd_route6_add_parsed(void *parsed_result, struct cmdline *cl, void 
 	cmdline_printf(cl, "route6 add ok\n");
 }
 
+static void cmd_attack_show_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)parsed_result;
+	(void)data;
+	if (!attack_shared_cfg) {
+		cmdline_printf(cl, "ATTACK: mitigation=0 scan_ports_sec=0 ban_sec=0 syn_pps=0 udp_pps=0 scan_events=0 scan_banned=0 top4=-/0 top6=-/0 (version 0)\n");
+		return;
+	}
+	uint64_t v1 = rte_atomic64_read(&attack_shared_cfg->version);
+	uint32_t scan_ports = attack_shared_cfg->scan_ports_per_sec;
+	uint32_t ban_sec = attack_shared_cfg->ban_seconds;
+	uint32_t syn_pps = attack_shared_cfg->syn_pps;
+	uint32_t udp_pps = attack_shared_cfg->udp_pps;
+	uint32_t scan_events = attack_shared_cfg->scan_events;
+	uint32_t scan_banned = attack_shared_cfg->scan_banned;
+	uint8_t mit = attack_shared_cfg->mitigation_enabled;
+	uint32_t top4_ip = attack_shared_cfg->top_scan4_ip;
+	uint32_t top4_ports = attack_shared_cfg->top_scan4_ports;
+	struct rte_ipv6_addr top6_ip = attack_shared_cfg->top_scan6_ip;
+	uint32_t top6_ports = attack_shared_cfg->top_scan6_ports;
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&attack_shared_cfg->version);
+	if (v1 != v2) {
+		v1 = v2;
+	}
+	char top4buf[INET_ADDRSTRLEN];
+	if (top4_ip) {
+		print_ipv4(top4buf, sizeof(top4buf), top4_ip);
+	} else {
+		snprintf(top4buf, sizeof(top4buf), "-");
+	}
+	char top6buf[INET6_ADDRSTRLEN];
+	const struct rte_ipv6_addr unspec = RTE_IPV6_ADDR_UNSPEC;
+	if (!rte_ipv6_addr_eq(&top6_ip, &unspec)) {
+		print_ipv6(top6buf, sizeof(top6buf), &top6_ip);
+	} else {
+		snprintf(top6buf, sizeof(top6buf), "-");
+	}
+	cmdline_printf(cl,
+		"ATTACK: mitigation=%u scan_ports_sec=%u ban_sec=%u syn_pps=%u udp_pps=%u scan_events=%u scan_banned=%u top4=%s/%u top6=%s/%u (version %" PRIu64 ")\n",
+		mit ? 1u : 0u, scan_ports, ban_sec, syn_pps, udp_pps, scan_events, scan_banned,
+		top4buf, top4_ports, top6buf, top6_ports, v1);
+}
+
+static void cmd_attack_set_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)data;
+	struct cmd_attack_set_result *res = parsed_result;
+	if (!attack_shared_cfg) {
+		cmdline_printf(cl, "attack set failed\n");
+		return;
+	}
+	if (res->mitigation > 1) {
+		cmdline_printf(cl, "attack set failed\n");
+		return;
+	}
+	if (res->scan_ports_sec == 0 || res->ban_sec == 0) {
+		cmdline_printf(cl, "attack set failed\n");
+		return;
+	}
+	attack_shared_cfg->mitigation_enabled = (uint8_t)res->mitigation;
+	attack_shared_cfg->scan_ports_per_sec = res->scan_ports_sec;
+	attack_shared_cfg->ban_seconds = res->ban_sec;
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&attack_shared_cfg->version);
+	rte_atomic64_set(&attack_shared_cfg->version, v + 1);
+	cmdline_printf(cl, "attack set ok\n");
+}
+
 static void cmd_ddos_show_parsed(void *parsed_result, struct cmdline *cl, void *data) {
 	(void)parsed_result;
 	(void)data;
@@ -1234,6 +1390,38 @@ cmdline_parse_inst_t cmd_acl_list = {
 	.tokens = {
 		(void *)&cmd_acl_list_acl,
 		(void *)&cmd_acl_list_list,
+		NULL,
+	},
+};
+
+cmdline_parse_token_string_t cmd_acl_hits_acl =
+	TOKEN_STRING_INITIALIZER(struct cmd_acl_hits_result, acl, "acl");
+cmdline_parse_token_string_t cmd_acl_hits_hits =
+	TOKEN_STRING_INITIALIZER(struct cmd_acl_hits_result, hits, "hits");
+
+cmdline_parse_inst_t cmd_acl_hits = {
+	.f = cmd_acl_hits_parsed,
+	.data = NULL,
+	.help_str = "acl hits",
+	.tokens = {
+		(void *)&cmd_acl_hits_acl,
+		(void *)&cmd_acl_hits_hits,
+		NULL,
+	},
+};
+
+cmdline_parse_token_string_t cmd_acl6_hits_acl6 =
+	TOKEN_STRING_INITIALIZER(struct cmd_acl6_hits_result, acl6, "acl6");
+cmdline_parse_token_string_t cmd_acl6_hits_hits =
+	TOKEN_STRING_INITIALIZER(struct cmd_acl6_hits_result, hits, "hits");
+
+cmdline_parse_inst_t cmd_acl6_hits = {
+	.f = cmd_acl6_hits_parsed,
+	.data = NULL,
+	.help_str = "acl6 hits",
+	.tokens = {
+		(void *)&cmd_acl6_hits_acl6,
+		(void *)&cmd_acl6_hits_hits,
 		NULL,
 	},
 };
@@ -1434,6 +1622,47 @@ cmdline_parse_inst_t cmd_deny6_list = {
 	},
 };
 
+cmdline_parse_token_string_t cmd_attack_show_attack =
+	TOKEN_STRING_INITIALIZER(struct cmd_attack_show_result, attack, "attack");
+cmdline_parse_token_string_t cmd_attack_show_show =
+	TOKEN_STRING_INITIALIZER(struct cmd_attack_show_result, show, "show");
+
+cmdline_parse_inst_t cmd_attack_show = {
+	.f = cmd_attack_show_parsed,
+	.data = NULL,
+	.help_str = "attack show",
+	.tokens = {
+		(void *)&cmd_attack_show_attack,
+		(void *)&cmd_attack_show_show,
+		NULL,
+	},
+};
+
+cmdline_parse_token_string_t cmd_attack_set_attack =
+	TOKEN_STRING_INITIALIZER(struct cmd_attack_set_result, attack, "attack");
+cmdline_parse_token_string_t cmd_attack_set_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_attack_set_result, set, "set");
+cmdline_parse_token_num_t cmd_attack_set_mitigation =
+	TOKEN_NUM_INITIALIZER(struct cmd_attack_set_result, mitigation, RTE_UINT32);
+cmdline_parse_token_num_t cmd_attack_set_scan_ports_sec =
+	TOKEN_NUM_INITIALIZER(struct cmd_attack_set_result, scan_ports_sec, RTE_UINT32);
+cmdline_parse_token_num_t cmd_attack_set_ban_sec =
+	TOKEN_NUM_INITIALIZER(struct cmd_attack_set_result, ban_sec, RTE_UINT32);
+
+cmdline_parse_inst_t cmd_attack_set = {
+	.f = cmd_attack_set_parsed,
+	.data = NULL,
+	.help_str = "attack set <mitigation 0|1> <scan_ports_sec> <ban_sec>",
+	.tokens = {
+		(void *)&cmd_attack_set_attack,
+		(void *)&cmd_attack_set_set,
+		(void *)&cmd_attack_set_mitigation,
+		(void *)&cmd_attack_set_scan_ports_sec,
+		(void *)&cmd_attack_set_ban_sec,
+		NULL,
+	},
+};
+
 cmdline_parse_token_string_t cmd_ddos_show_ddos =
 	TOKEN_STRING_INITIALIZER(struct cmd_ddos_show_result, ddos, "ddos");
 cmdline_parse_token_string_t cmd_ddos_show_show =
@@ -1616,10 +1845,12 @@ cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_acl_del,
 	(cmdline_parse_inst_t *)&cmd_acl_clear,
 	(cmdline_parse_inst_t *)&cmd_acl_list,
+	(cmdline_parse_inst_t *)&cmd_acl_hits,
 	(cmdline_parse_inst_t *)&cmd_acl6_add,
 	(cmdline_parse_inst_t *)&cmd_acl6_del,
 	(cmdline_parse_inst_t *)&cmd_acl6_clear,
 	(cmdline_parse_inst_t *)&cmd_acl6_list,
+	(cmdline_parse_inst_t *)&cmd_acl6_hits,
 	(cmdline_parse_inst_t *)&cmd_session_list,
 	(cmdline_parse_inst_t *)&cmd_session6_list,
 	(cmdline_parse_inst_t *)&cmd_port_stats,
@@ -1632,6 +1863,8 @@ cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_route6_add,
 	(cmdline_parse_inst_t *)&cmd_route6_del,
 	(cmdline_parse_inst_t *)&cmd_route6_clear,
+	(cmdline_parse_inst_t *)&cmd_attack_show,
+	(cmdline_parse_inst_t *)&cmd_attack_set,
 	(cmdline_parse_inst_t *)&cmd_ddos_show,
 	(cmdline_parse_inst_t *)&cmd_ddos_set,
 	(cmdline_parse_inst_t *)&cmd_acl_quit,
@@ -1742,6 +1975,10 @@ int main(int argc, char **argv) {
 	}
 
 	acl_shared_cfg = (struct acl_shared_cfg *)mz->addr;
+	const struct rte_memzone *hitz = rte_memzone_lookup(ACL_HIT_SHARED_NAME);
+	if (hitz) {
+		acl_hit_shared_cfg = (struct acl_hit_shared_cfg *)hitz->addr;
+	}
 	acl6_cmd_ring = rte_ring_lookup(ACL6_CMD_RING_NAME);
 	acl6_resp_ring = rte_ring_lookup(ACL6_RESP_RING_NAME);
 	if (!acl6_cmd_ring || !acl6_resp_ring) {
@@ -1752,6 +1989,10 @@ int main(int argc, char **argv) {
 		return -1;
 	}
 	acl6_shared_cfg = (struct acl6_shared_cfg *)mz6->addr;
+	const struct rte_memzone *hitz6 = rte_memzone_lookup(ACL6_HIT_SHARED_NAME);
+	if (hitz6) {
+		acl6_hit_shared_cfg = (struct acl6_hit_shared_cfg *)hitz6->addr;
+	}
 	const struct rte_memzone *smz = rte_memzone_lookup(SESSION_SHARED_NAME);
 	if (smz) {
 		session_shared_cfg = (struct session_shared_cfg *)smz->addr;
@@ -1775,6 +2016,10 @@ int main(int argc, char **argv) {
 	const struct rte_memzone *rt6 = rte_memzone_lookup(ROUTE6_SHARED_NAME);
 	if (rt6) {
 		route6_shared_cfg = (struct route6_shared_cfg *)rt6->addr;
+	}
+	const struct rte_memzone *amz = rte_memzone_lookup(ATTACK_SHARED_NAME);
+	if (amz) {
+		attack_shared_cfg = (struct attack_shared_cfg *)amz->addr;
 	}
 	const struct rte_memzone *rmz = rte_memzone_lookup(RLIM_SHARED_NAME);
 	if (rmz) {

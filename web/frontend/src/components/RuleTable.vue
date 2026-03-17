@@ -23,6 +23,8 @@
     </el-table-column>
     <el-table-column prop="sport" label="源端口" width="120" />
     <el-table-column prop="dport" label="目的端口" width="120" />
+    <el-table-column prop="deny_pkts" label="命中包" width="120" sortable />
+    <el-table-column prop="deny_bytes" label="命中字节" width="140" sortable />
     <el-table-column label="操作" width="120">
       <template #default="{row}">
         <el-button size="small" type="danger" @click="$emit('delete', row.index)">删除</el-button>

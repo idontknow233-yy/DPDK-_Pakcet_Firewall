@@ -30,6 +30,24 @@ export async function getAcl6Snapshot(): Promise<AclSnapshot> {
   return data
 }
 
+export type AclHitsSnapshot = {
+  version: number
+  rule_version: number
+  count: number
+  pkts: number[]
+  bytes: number[]
+}
+
+export async function getAclHits(): Promise<AclHitsSnapshot> {
+  const { data } = await api.get('/api/acl/hits')
+  return data
+}
+
+export async function getAcl6Hits(): Promise<AclHitsSnapshot> {
+  const { data } = await api.get('/api/acl6/hits')
+  return data
+}
+
 export async function getIfcfg6(): Promise<{ version: number; count: number; ifaces: { port: number; cidr: string }[] }> {
   const { data } = await api.get('/api/ifcfg6')
   return data
@@ -58,6 +76,30 @@ export async function deleteRoute6(index: number): Promise<void> {
 
 export async function clearRoute6(): Promise<void> {
   await api.delete('/api/route6/')
+}
+
+export type AttackSnapshot = {
+  version: number
+  mitigation: number
+  scan_ports_sec: number
+  ban_sec: number
+  syn_pps: number
+  udp_pps: number
+  scan_events: number
+  scan_banned: number
+  top4: string
+  top4_ports: number
+  top6: string
+  top6_ports: number
+}
+
+export async function getAttack(): Promise<AttackSnapshot> {
+  const { data } = await api.get('/api/attack')
+  return data
+}
+
+export async function setAttack(payload: { mitigation: number; scan_ports_sec: number; ban_sec: number }): Promise<void> {
+  await api.post('/api/attack', payload)
 }
 
 export async function getHealth(): Promise<boolean> {
@@ -100,6 +142,10 @@ export type PortStatsRow = {
   rx: number
   tx: number
   dropped: number
+  link?: string
+  speed?: number
+  duplex?: string
+  mac?: string
 }
 
 export type PortStatsSnapshot = {
