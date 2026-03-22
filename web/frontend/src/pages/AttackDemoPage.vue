@@ -5,8 +5,8 @@
         <div class="atk-head">
           <div class="atk-title">攻击演示与一键防护</div>
           <div class="atk-actions">
-            <el-button :loading="loading" @click="refresh">刷新</el-button>
-            <el-button type="primary" :loading="loading" @click="oneClickDefense">一键防护</el-button>
+            <el-button @click="refresh">刷新</el-button>
+            <el-button type="primary" :loading="applying" @click="oneClickDefense">一键防护</el-button>
           </div>
         </div>
         <div class="atk-meta">版本 {{ snap?.version ?? 0 }}，最近更新 {{ lastUpdated || '-' }}</div>
@@ -32,7 +32,7 @@
 
         <el-divider />
         <div class="atk-subtitle">Top 扫描源</div>
-        <el-table :data="topRows" size="small" stripe v-loading="loading" style="width:100%">
+        <el-table :data="topRows" size="small" stripe v-loading="applying" style="width:100%">
           <el-table-column prop="family" label="IP版本" width="90" />
           <el-table-column prop="ip" label="源地址" min-width="260" />
           <el-table-column prop="ports" label="端口数/秒" width="120" />
@@ -54,7 +54,7 @@
             <el-input-number v-model="banSec" :min="1" :max="3600" />
           </el-form-item>
           <el-form-item>
-            <el-button type="primary" :loading="loading" @click="apply">应用</el-button>
+            <el-button type="primary" :loading="applying" @click="apply">应用</el-button>
           </el-form-item>
         </el-form>
         <el-divider />
@@ -76,6 +76,7 @@ import { ElMessage } from 'element-plus'
 import { getAttack, setAttack, setDdos, type AttackSnapshot } from '../services/api'
 
 const loading = ref(false)
+const applying = ref(false)
 const snap = ref<AttackSnapshot | null>(null)
 const lastUpdated = ref('')
 const mitigation = ref(0)
@@ -93,7 +94,6 @@ const topRows = computed(() => {
 })
 
 async function refresh() {
-  loading.value = true
   try {
     const s = await getAttack()
     snap.value = s
@@ -103,13 +103,11 @@ async function refresh() {
     lastUpdated.value = new Date().toLocaleString()
   } catch (e: any) {
     ElMessage.error(e?.message || '获取攻击状态失败')
-  } finally {
-    loading.value = false
   }
 }
 
 async function apply() {
-  loading.value = true
+  applying.value = true
   try {
     await setAttack({ mitigation: mitigation.value, scan_ports_sec: scanPortsSec.value, ban_sec: banSec.value })
     ElMessage.success('已应用')
@@ -117,12 +115,12 @@ async function apply() {
   } catch (e: any) {
     ElMessage.error(e?.message || '应用失败')
   } finally {
-    loading.value = false
+    applying.value = false
   }
 }
 
 async function oneClickDefense() {
-  loading.value = true
+  applying.value = true
   try {
     await setDdos({ syn_pps: 5000, syn_burst: 2000, udp_pps: 20000, udp_burst: 5000 })
     await setAttack({ mitigation: 1, scan_ports_sec: 30, ban_sec: 120 })
@@ -131,7 +129,7 @@ async function oneClickDefense() {
   } catch (e: any) {
     ElMessage.error(e?.message || '一键防护失败')
   } finally {
-    loading.value = false
+    applying.value = false
   }
 }
 

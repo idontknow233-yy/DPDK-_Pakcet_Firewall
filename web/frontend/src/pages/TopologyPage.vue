@@ -9,7 +9,7 @@
             <el-option :value="2000" label="2秒刷新" />
             <el-option :value="5000" label="5秒刷新" />
           </el-select>
-          <el-button :loading="loading" @click="refresh">刷新</el-button>
+          <el-button @click="refresh">刷新</el-button>
         </div>
       </div>
       <div class="topo-meta">版本 {{ snap?.version ?? 0 }}，最近更新 {{ lastUpdated || '-' }}</div>
@@ -63,7 +63,6 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getPortStats, type PortStatsRow, type PortStatsSnapshot } from '../services/api'
 
-const loading = ref(false)
 const snap = ref<PortStatsSnapshot | null>(null)
 const last = ref<Map<number, { t: number; rx: number; tx: number; dropped: number }>>(new Map())
 const lastUpdated = ref('')
@@ -78,7 +77,6 @@ function calcPps(prev: number, cur: number, dtMs: number) {
 }
 
 async function refresh() {
-  loading.value = true
   try {
     const s = await getPortStats()
     const now = Date.now()
@@ -94,8 +92,6 @@ async function refresh() {
     lastUpdated.value = new Date().toLocaleString()
   } catch (e: any) {
     ElMessage.error(e?.message || '获取端口状态失败')
-  } finally {
-    loading.value = false
   }
 }
 
