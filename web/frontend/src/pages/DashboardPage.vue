@@ -1,7 +1,7 @@
 <template>
   <div>
     <div class="dash-cards">
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">控制面健康</div>
         <div class="dash-card__value">
           <el-tag :type="healthy ? 'success' : 'danger'" effect="dark">
@@ -9,23 +9,23 @@
           </el-tag>
         </div>
       </el-card>
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">规则数量</div>
         <div class="dash-card__value">{{ count }}</div>
       </el-card>
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">规则版本</div>
         <div class="dash-card__value">{{ version }}</div>
       </el-card>
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">RX PPS</div>
         <div class="dash-card__value">{{ rxPps }}</div>
       </el-card>
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">TX PPS</div>
         <div class="dash-card__value">{{ txPps }}</div>
       </el-card>
-      <el-card class="dash-card" v-loading="loading">
+      <el-card class="dash-card">
         <div class="dash-card__label">DROP PPS</div>
         <div class="dash-card__value">{{ dropPps }}</div>
       </el-card>
@@ -66,7 +66,7 @@
 </template>
 
 <script lang="ts" setup>
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import * as echarts from 'echarts'
 import { computed } from 'vue'
 import { type DenyRow, getAclSnapshot, getDenies, getDenies6, getHealth, getPortStats } from '../services/api'
@@ -80,8 +80,8 @@ const rxPps = ref(0)
 const txPps = ref(0)
 const dropPps = ref(0)
 const denyTab = ref<'4' | '6'>('4')
-const denies4 = ref<DenyRow[]>([])
-const denies6 = ref<DenyRow[]>([])
+const denies4 = shallowRef<DenyRow[]>([])
+const denies6 = shallowRef<DenyRow[]>([])
 const denies = computed(() => denyTab.value === '6' ? denies6.value : denies4.value)
 let timer: any
 let chartRules: echarts.ECharts | null = null
@@ -95,77 +95,67 @@ const trafficDrop: number[] = []
 let lastPortTotals: { rx: number; tx: number; dropped: number; t: number } | null = null
 
 async function refresh() {
-  loading.value = true
-  try {
-    healthy.value = await getHealth()
-    const snap = await getAclSnapshot()
-    count.value = snap.count
-    version.value = snap.version
-    const t = new Date().toLocaleTimeString()
-    rulesXs.push(t)
-    rulesYs.push(snap.count)
-    if (rulesXs.length > 24) {
-      rulesXs.shift()
-      rulesYs.shift()
-    }
-    const ps = await getPortStats()
-    let rx = 0
-    let tx = 0
-    let dropped = 0
-    for (const p of ps.ports) {
-      rx += p.rx
-      tx += p.tx
-      dropped += p.dropped
-    }
-    const nowMs = Date.now()
-    if (lastPortTotals) {
-      const dt = (nowMs - lastPortTotals.t) / 1000
-      if (dt > 0) {
-        rxPps.value = Math.max(0, Math.round((rx - lastPortTotals.rx) / dt))
-        txPps.value = Math.max(0, Math.round((tx - lastPortTotals.tx) / dt))
-        dropPps.value = Math.max(0, Math.round((dropped - lastPortTotals.dropped) / dt))
-      }
-    }
-    lastPortTotals = { rx, tx, dropped, t: nowMs }
-    trafficXs.push(t)
-    trafficRx.push(rxPps.value)
-    trafficTx.push(txPps.value)
-    trafficDrop.push(dropPps.value)
-    if (trafficXs.length > 24) {
-      trafficXs.shift()
-      trafficRx.shift()
-      trafficTx.shift()
-      trafficDrop.shift()
-    }
-    const ds = await getDenies(20)
-    denies4.value = ds.denies
-    try {
-      const ds6 = await getDenies6(20)
-      denies6.value = ds6.denies
-    } catch {}
-    lastUpdated.value = new Date().toLocaleString()
-    chartRules?.setOption({
-      tooltip: { trigger: 'axis' },
-      grid: { left: 32, right: 16, top: 20, bottom: 24 },
-      xAxis: { type: 'category', data: rulesXs, boundaryGap: false },
-      yAxis: { type: 'value', minInterval: 1 },
-      series: [{ name: 'rules', type: 'line', data: rulesYs, smooth: true, showSymbol: false, areaStyle: { opacity: 0.08 } }]
-    })
-    chartTraffic?.setOption({
-      tooltip: { trigger: 'axis' },
-      legend: { top: 0 },
-      grid: { left: 48, right: 16, top: 28, bottom: 24 },
-      xAxis: { type: 'category', data: trafficXs, boundaryGap: false },
-      yAxis: { type: 'value', minInterval: 1 },
-      series: [
-        { name: 'rx_pps', type: 'line', data: trafficRx, smooth: true, showSymbol: false },
-        { name: 'tx_pps', type: 'line', data: trafficTx, smooth: true, showSymbol: false },
-        { name: 'drop_pps', type: 'line', data: trafficDrop, smooth: true, showSymbol: false }
-      ]
-    })
-  } finally {
-    loading.value = false
+  const [health, snap, ps, ds] = await Promise.all([
+    getHealth().catch(() => false),
+    getAclSnapshot().catch(() => ({ count: 0, version: 0 })),
+    getPortStats().catch(() => ({ ports: [] })),
+    getDenies(20).catch(() => ({ denies: [] }))
+  ])
+  const [ds6] = await Promise.all([getDenies6(20).catch(() => ({ denies: [] }))])
+
+  healthy.value = health
+  count.value = snap.count
+  version.value = snap.version
+  
+  const t = new Date().toLocaleTimeString()
+  rulesXs.push(t)
+  rulesYs.push(snap.count)
+  if (rulesXs.length > 24) {
+    rulesXs.shift()
+    rulesYs.shift()
   }
+
+  let rx = 0, tx = 0, dropped = 0
+  for (const p of ps.ports) {
+    rx += p.rx
+    tx += p.tx
+    dropped += p.dropped
+  }
+  const nowMs = Date.now()
+  if (lastPortTotals) {
+    const dt = (nowMs - lastPortTotals.t) / 1000
+    if (dt > 0) {
+      rxPps.value = Math.max(0, Math.round((rx - lastPortTotals.rx) / dt))
+      txPps.value = Math.max(0, Math.round((tx - lastPortTotals.tx) / dt))
+      dropPps.value = Math.max(0, Math.round((dropped - lastPortTotals.dropped) / dt))
+    }
+  }
+  lastPortTotals = { rx, tx, dropped, t: nowMs }
+  
+  trafficXs.push(t)
+  trafficRx.push(rxPps.value)
+  trafficTx.push(txPps.value)
+  trafficDrop.push(dropPps.value)
+  if (trafficXs.length > 24) {
+    trafficXs.shift(); trafficRx.shift(); trafficTx.shift(); trafficDrop.shift()
+  }
+
+  denies4.value = ds.denies
+  denies6.value = ds6.denies
+  lastUpdated.value = new Date().toLocaleString()
+
+  chartRules?.setOption({
+    xAxis: { data: rulesXs },
+    series: [{ data: rulesYs }]
+  }, { replaceMerge: ['series'] })
+  chartTraffic?.setOption({
+    xAxis: { data: trafficXs },
+    series: [
+      { data: trafficRx },
+      { data: trafficTx },
+      { data: trafficDrop }
+    ]
+  }, { replaceMerge: ['series'] })
 }
 
 onMounted(() => {

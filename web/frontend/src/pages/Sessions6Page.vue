@@ -47,13 +47,13 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getSessions6, type SessionRow } from '../services/api'
 
 const version = ref(0)
 const count = ref(0)
-const rows = ref<SessionRow[]>([])
+const rows = shallowRef<SessionRow[]>([])
 const loading = ref(false)
 const lastUpdated = ref('')
 const q = ref('')
@@ -74,15 +74,16 @@ function formatAge(ms: number) {
 
 const filtered = computed(() => {
   const kw = q.value.trim().toLowerCase()
+  const p = proto.value
+  if (!kw && !p) return rows.value
   return rows.value.filter((r) => {
-    if (proto.value && r.proto !== proto.value) return false
+    if (p && r.proto !== p) return false
     if (!kw) return true
     return r.src.toLowerCase().includes(kw) || r.dst.toLowerCase().includes(kw)
   })
 })
 
 async function refresh() {
-  loading.value = true
   try {
     const snap = await getSessions6(limit.value)
     version.value = snap.version
@@ -91,8 +92,6 @@ async function refresh() {
     lastUpdated.value = new Date().toLocaleString()
   } catch (e: any) {
     ElMessage.error(e?.message || '获取会话失败')
-  } finally {
-    loading.value = false
   }
 }
 

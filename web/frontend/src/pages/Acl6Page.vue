@@ -37,7 +37,7 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, ref } from 'vue'
+import { computed, ref, shallowRef } from 'vue'
 import RuleForm from '../components/RuleForm.vue'
 import RuleTable from '../components/RuleTable.vue'
 import { addAcl6Rule, clearAcl6, deleteAcl6Rule, getAcl6Snapshot, getAcl6Hits } from '../services/api'
@@ -45,7 +45,7 @@ import { ElMessageBox, ElMessage } from 'element-plus'
 
 const version = ref(0)
 const count = ref(0)
-const rows = ref<any[]>([])
+const rows = shallowRef<any[]>([])
 const loading = ref(false)
 const submitting = ref(false)
 const lastUpdated = ref('')
@@ -54,36 +54,29 @@ const actionFilter = ref<string | undefined>()
 const protoFilter = ref<string | undefined>()
 const formKey = ref(0)
 
-function mapRows(rules: any[]) { return rules }
-
 async function refresh() {
-  loading.value = true
-  try {
-    const snap = await getAcl6Snapshot()
-    const hits = await getAcl6Hits().catch(() => null)
-    version.value = snap.version
-    count.value = snap.count
-    rows.value = mapRows(snap.rules).map((r: any) => ({
-      ...r,
-      deny_pkts: hits?.pkts?.[r.index] ?? 0,
-      deny_bytes: hits?.bytes?.[r.index] ?? 0
-    }))
-    lastUpdated.value = new Date().toLocaleString()
-  } catch (e: any) {
-    ElMessage.error(e?.message || '获取ACL失败')
-  } finally {
-    loading.value = false
-  }
+  const [snap, hits] = await Promise.all([
+    getAcl6Snapshot().catch(() => ({ rules: [], version: 0, count: 0 })),
+    getAcl6Hits().catch(() => null)
+  ])
+  version.value = snap.version
+  count.value = snap.count
+  rows.value = snap.rules.map((r: any) => ({
+    ...r,
+    deny_pkts: hits?.pkts?.[r.index] ?? 0,
+    deny_bytes: hits?.bytes?.[r.index] ?? 0
+  }))
+  lastUpdated.value = new Date().toLocaleString()
 }
 
 const filteredRows = computed(() => {
   const kw = q.value.trim().toLowerCase()
+  const af = actionFilter.value
+  const pf = protoFilter.value
+  if (!kw && !af && !pf) return rows.value
   return rows.value.filter((r) => {
-    if (actionFilter.value && r.action !== actionFilter.value) return false
-    if (protoFilter.value) {
-      const p = String(r.proto)
-      if (p !== protoFilter.value) return false
-    }
+    if (af && r.action !== af) return false
+    if (pf && String(r.proto) !== pf) return false
     if (!kw) return true
     return String(r.src).toLowerCase().includes(kw) || String(r.dst).toLowerCase().includes(kw)
   })

@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/yy/dpdk/dpdk-stable-24.11.4/**",
+                "/home/yy/dpdk/dpdk-stable-24.11.4/lib/**",
+                "/home/yy/dpdk/dpdk-stable-24.11.4/drivers/**",
+                "/home/yy/dpdk/dpdk-stable-24.11.4/dpdkbuild/include/**",
+                "/usr/include/dpdk/**",
+                "/usr/local/include/dpdk/**"
+            ],
+            "defines": [
+                "RTE_EXEC_ENV_LINUXAPP",
+                "RTE_NEXT_ABI"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
