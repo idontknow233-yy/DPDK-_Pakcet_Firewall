@@ -21,6 +21,7 @@ struct route_bucket {
 struct route_table {
     struct route_bucket *buckets;
     uint32_t capacity;
+    uint32_t count;
 };
 
 int route_table_init(struct route_table *tbl, const char *name, uint32_t capacity, int socket_id) {
@@ -29,6 +30,7 @@ int route_table_init(struct route_table *tbl, const char *name, uint32_t capacit
     tbl->buckets = calloc(capacity, sizeof(struct route_bucket));
     if (!tbl->buckets) return -1;
     tbl->capacity = capacity;
+    tbl->count = 0;
     return 0;
 }
 
@@ -43,18 +45,23 @@ int route_add(struct route_table *tbl, uint32_t prefix, uint8_t depth, const str
     if (!tbl || !tbl->buckets || !entry) return -1;
     if (depth > 32) return -1;
     
-    uint32_t idx = prefix % tbl->capacity;
-    tbl->buckets[idx].prefix = prefix;
-    tbl->buckets[idx].depth = depth;
-    tbl->buckets[idx].entry = *entry;
-    tbl->buckets[idx].valid = 1;
-    return 0;
+    for (uint32_t i = 0; i < tbl->capacity; i++) {
+        if (!tbl->buckets[i].valid) {
+            tbl->buckets[i].prefix = prefix;
+            tbl->buckets[i].depth = depth;
+            tbl->buckets[i].entry = *entry;
+            tbl->buckets[i].valid = 1;
+            tbl->count++;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 static uint32_t mask_from_depth(uint8_t depth) {
     if (depth == 0) return 0;
     if (depth == 32) return 0xFFFFFFFF;
-    return ((uint32_t)0xFFFFFFFF) << (32 - depth);
+    return (((uint32_t)0xFFFFFFFF) << (32 - depth));
 }
 
 int route_lookup(const struct route_table *tbl, uint32_t ip, struct route_entry *result) {
@@ -69,7 +76,7 @@ int route_lookup(const struct route_table *tbl, uint32_t ip, struct route_entry 
         
         uint32_t mask = mask_from_depth(b->depth);
         if ((ip & mask) == (b->prefix & mask)) {
-            if (b->depth > best_depth) {
+            if (b->depth >= best_depth) {
                 best_depth = b->depth;
                 best = b;
             }

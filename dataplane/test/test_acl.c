@@ -288,24 +288,34 @@ void test_acl_ipv4_match(void) {
 void test_acl_port_range_match(void) {
     printf("\n=== test_acl_port_range_match ===\n");
     struct acl_ctx ctx;
-    struct acl_rule http_rule = {
+    struct acl_rule deny_http = {
         .proto = IPPROTO_TCP,
+        .src_port_min = 0,
+        .src_port_max = 65535,
         .dst_port_min = 80,
         .dst_port_max = 80,
         .match_ports = 1,
+        .allow = 0,
+    };
+    struct acl_rule allow_all = {
+        .proto = 0,
+        .match_ports = 0,
         .allow = 1,
     };
     
     ck_assert_int_eq(acl_init(&ctx, 16), 0);
-    ck_assert_int_eq(acl_add_rule(&ctx, &http_rule), 0);
+    ck_assert_int_eq(acl_add_rule(&ctx, &deny_http), 0);
+    ck_assert_int_eq(acl_add_rule(&ctx, &allow_all), 0);
     
     rte_ipv4_hdr ip = { .next_proto_id = IPPROTO_TCP };
-    uint8_t tcp_80[4] = { 0, 0, 0, 80 };
-    uint8_t tcp_443[4] = { 0, 0, 1, 0xBB };
+    // TCP header: src_port at offset 0-1, dst_port at offset 2-3
+    // src_port=12345=0x3039, dst_port=80=0x0050
+    uint8_t tcp_80[4] = { 0x30, 0x39, 0x00, 0x50 };
+    // src_port=12345=0x3039, dst_port=443=0x01BB
+    uint8_t tcp_443[4] = { 0x30, 0x39, 0x01, 0xBB };
     
-    ck_assert(acl_check_ipv4(&ctx, &ip, tcp_80, NULL));
-    
-    ck_assert(!acl_check_ipv4(&ctx, &ip, tcp_443, NULL));
+    ck_assert(!acl_check_ipv4(&ctx, &ip, tcp_80, NULL));
+    ck_assert(acl_check_ipv4(&ctx, &ip, tcp_443, NULL));
     
     acl_free(&ctx);
 }

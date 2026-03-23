@@ -60,8 +60,12 @@ void session_table_free(struct session_table *tbl) {
 }
 
 static uint32_t session_hash(const struct session_key *key) {
-    uint32_t h = key->src_ip ^ key->dst_ip ^ key->src_port ^ key->dst_port ^ key->proto;
-    return h;
+    uint32_t h = key->src_ip;
+    h = h * 31 + key->dst_ip;
+    h = h * 31 + key->src_port;
+    h = h * 31 + key->dst_port;
+    h = h * 31 + key->proto;
+    return h % 1024;
 }
 
 struct session_entry *session_lookup(struct session_table *tbl, const struct session_key *key) {
@@ -128,6 +132,16 @@ static int tests_passed = 0;
     } \
 } while(0)
 
+#define ck_assert_ptr_eq(a, b) do { \
+    tests_run++; \
+    if ((a) == (b)) { \
+        tests_passed++; \
+        printf("  PASS: %s == %s\n", #a, #b); \
+    } else { \
+        printf("  FAIL: %s != %s\n", #a, #b); \
+    } \
+} while(0)
+
 #define ck_assert(expr) do { \
     tests_run++; \
     if (expr) { \
@@ -184,13 +198,13 @@ void test_session_lookup(void) {
     }
     
     struct session_key key_not_exist = {
-        .src_ip = RTE_IPV4(192, 168, 1, 200),
-        .dst_ip = RTE_IPV4(10, 0, 0, 1),
-        .src_port = 12345,
-        .dst_port = 80,
+        .src_ip = RTE_IPV4(192, 168, 2, 100),
+        .dst_ip = RTE_IPV4(10, 0, 0, 2),
+        .src_port = 54321,
+        .dst_port = 443,
         .proto = IPPROTO_TCP,
     };
-    ck_assert_ptr_ne(session_lookup(&tbl, &key_not_exist), NULL);
+    ck_assert_ptr_eq(session_lookup(&tbl, &key_not_exist), NULL);
     
     session_table_free(&tbl);
 }
