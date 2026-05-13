@@ -61,6 +61,19 @@ export async function clearIfcfg6(port: number): Promise<void> {
   await api.delete(`/api/ifcfg6/${port}`)
 }
 
+export async function getIfcfg4(): Promise<{ version: number; count: number; ifaces: { port: number; cidr: string }[] }> {
+  const { data } = await api.get('/api/ifcfg4')
+  return data
+}
+
+export async function setIfcfg4(port: number, cidr: string): Promise<void> {
+  await api.post('/api/ifcfg4', { port, cidr })
+}
+
+export async function clearIfcfg4(port: number): Promise<void> {
+  await api.delete(`/api/ifcfg4/${port}`)
+}
+
 export async function getRoute6(): Promise<{ version: number; count: number; routes: { index: number; dst: string; nh: string; port: number }[] }> {
   const { data } = await api.get('/api/route6')
   return data

@@ -12,6 +12,7 @@
         <el-menu-item index="/acl">ACL规则</el-menu-item>
         <el-menu-item index="/acl6">IPv6 ACL规则</el-menu-item>
         <el-menu-item index="/route6">IPv6 路由/接口</el-menu-item>
+        <el-menu-item index="/port-config">端口配置</el-menu-item>
         <el-menu-item index="/ddos">抗DDoS/限速</el-menu-item>
         <el-menu-item index="/sessions">会话表</el-menu-item>
         <el-menu-item index="/sessions6">IPv6 会话表</el-menu-item>

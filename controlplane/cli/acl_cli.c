@@ -36,6 +36,7 @@
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
 #include "ipc/route6_ipc.h"
+#include "ipc/portcfg_ipc.h"
 #include "ipc/attack_ipc.h"
 
 static volatile sig_atomic_t force_quit;
@@ -54,6 +55,7 @@ static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
+static struct portcfg_shared_cfg *portcfg_shared_cfg;
 static struct attack_shared_cfg *attack_shared_cfg;
 static const char *cli_host = "0.0.0.0";
 static uint16_t cli_port = 8086;
@@ -186,6 +188,24 @@ struct cmd_ifcfg6_set_result {
 
 struct cmd_ifcfg6_clear_result {
 	cmdline_fixed_string_t ifcfg6;
+	cmdline_fixed_string_t clear;
+	uint32_t port;
+};
+
+struct cmd_ifcfg4_show_result {
+	cmdline_fixed_string_t ifcfg4;
+	cmdline_fixed_string_t show;
+};
+
+struct cmd_ifcfg4_set_result {
+	cmdline_fixed_string_t ifcfg4;
+	cmdline_fixed_string_t set;
+	uint32_t port;
+	cmdline_fixed_string_t cidr;
+};
+
+struct cmd_ifcfg4_clear_result {
+	cmdline_fixed_string_t ifcfg4;
 	cmdline_fixed_string_t clear;
 	uint32_t port;
 };
@@ -1085,6 +1105,124 @@ static void cmd_ifcfg6_clear_parsed(void *parsed_result, struct cmdline *cl, voi
 	cmdline_printf(cl, "ifcfg6 clear ok\n");
 }
 
+static int parse_ipv4_cidr_str(const char *s, uint32_t *ip, uint8_t *depth) {
+	char *slash = strchr(s, '/');
+	char ipstr[64] = {0};
+	uint32_t d = 32;
+
+	if (slash) {
+		size_t ip_len = slash - s;
+		if (ip_len >= sizeof(ipstr)) {
+			return -1;
+		}
+		memcpy(ipstr, s, ip_len);
+		ipstr[ip_len] = '\0';
+		char *endp = NULL;
+		long v = strtol(slash + 1, &endp, 10);
+		if (!endp || *endp || v < 0 || v > 32) {
+			return -1;
+		}
+		d = (uint8_t)v;
+	} else {
+		if (strlen(s) >= sizeof(ipstr)) {
+			return -1;
+		}
+		memcpy(ipstr, s, strlen(s));
+	}
+
+	struct in_addr a;
+	if (inet_pton(AF_INET, ipstr, &a) != 1) {
+		return -1;
+	}
+	*ip = rte_be_to_cpu_32(a.s_addr);
+	*depth = d;
+	return 0;
+}
+
+static void cmd_ifcfg4_show_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)parsed_result;
+	(void)data;
+	if (!portcfg_shared_cfg) {
+		cmdline_printf(cl, "IFCFG4: 0 (version 0)\n");
+		return;
+	}
+	uint64_t v = rte_atomic64_read(&portcfg_shared_cfg->version);
+	uint32_t cnt = 0;
+	for (uint32_t p = 0; p < PORTCFG_MAX_PORTS; p++) {
+		if (portcfg_shared_cfg->ports[p].configured) {
+			cnt++;
+		}
+	}
+	cmdline_printf(cl, "IFCFG4: %u (version %" PRIu64 ")\n", cnt, v);
+	for (uint32_t p = 0; p < PORTCFG_MAX_PORTS; p++) {
+		const struct portcfg_item *it = &portcfg_shared_cfg->ports[p];
+		if (!it->configured) {
+			continue;
+		}
+		char ipbuf[INET_ADDRSTRLEN];
+		struct in_addr a;
+		a.s_addr = rte_cpu_to_be_32(it->ip);
+		inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
+		uint32_t mask = it->mask;
+		uint8_t bits = 0;
+		while (mask) {
+			bits += mask & 1;
+			mask >>= 1;
+		}
+		cmdline_printf(cl, "port=%u ip=%s/%u\n", p, ipbuf, bits);
+	}
+}
+
+static void cmd_ifcfg4_set_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)data;
+	struct cmd_ifcfg4_set_result *res = parsed_result;
+	if (!portcfg_shared_cfg) {
+		cmdline_printf(cl, "ifcfg4 set failed\n");
+		return;
+	}
+	if (res->port >= PORTCFG_MAX_PORTS) {
+		cmdline_printf(cl, "ifcfg4 set failed\n");
+		return;
+	}
+	uint32_t ip = 0;
+	uint8_t depth = 0;
+	if (parse_ipv4_cidr_str(res->cidr, &ip, &depth) != 0) {
+		cmdline_printf(cl, "ifcfg4 set failed\n");
+		return;
+	}
+	uint32_t mask = 0;
+	if (depth == 0) {
+		mask = 0;
+	} else {
+		mask = (0xFFFFFFFFu << (32 - depth)) & 0xFFFFFFFFu;
+	}
+	portcfg_shared_cfg->ports[res->port].ip = ip;
+	portcfg_shared_cfg->ports[res->port].mask = mask;
+	portcfg_shared_cfg->ports[res->port].configured = 1;
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&portcfg_shared_cfg->version);
+	rte_atomic64_set(&portcfg_shared_cfg->version, v + 1);
+	cmdline_printf(cl, "ifcfg4 set ok\n");
+}
+
+static void cmd_ifcfg4_clear_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+	(void)data;
+	struct cmd_ifcfg4_clear_result *res = parsed_result;
+	if (!portcfg_shared_cfg) {
+		cmdline_printf(cl, "ifcfg4 clear failed\n");
+		return;
+	}
+	if (res->port >= PORTCFG_MAX_PORTS) {
+		cmdline_printf(cl, "ifcfg4 clear failed\n");
+		return;
+	}
+	memset(&portcfg_shared_cfg->ports[res->port], 0, sizeof(portcfg_shared_cfg->ports[res->port]));
+	rte_wmb();
+	uint64_t v = rte_atomic64_read(&portcfg_shared_cfg->version);
+	rte_atomic64_set(&portcfg_shared_cfg->version, v + 1);
+	cmdline_printf(cl, "ifcfg4 clear ok\n");
+}
+
 static void cmd_route6_list_parsed(void *parsed_result, struct cmdline *cl, void *data) {
 	(void)parsed_result;
 	(void)data;
@@ -1764,6 +1902,63 @@ cmdline_parse_inst_t cmd_ifcfg6_clear = {
 	},
 };
 
+cmdline_parse_token_string_t cmd_ifcfg4_show_ifcfg4 =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_show_result, ifcfg4, "ifcfg4");
+cmdline_parse_token_string_t cmd_ifcfg4_show_show =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_show_result, show, "show");
+
+cmdline_parse_inst_t cmd_ifcfg4_show = {
+	.f = cmd_ifcfg4_show_parsed,
+	.data = NULL,
+	.help_str = "ifcfg4 show",
+	.tokens = {
+		(void *)&cmd_ifcfg4_show_ifcfg4,
+		(void *)&cmd_ifcfg4_show_show,
+		NULL,
+	},
+};
+
+cmdline_parse_token_string_t cmd_ifcfg4_set_ifcfg4 =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_set_result, ifcfg4, "ifcfg4");
+cmdline_parse_token_string_t cmd_ifcfg4_set_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_set_result, set, "set");
+cmdline_parse_token_num_t cmd_ifcfg4_set_port =
+	TOKEN_NUM_INITIALIZER(struct cmd_ifcfg4_set_result, port, RTE_UINT32);
+cmdline_parse_token_string_t cmd_ifcfg4_set_cidr =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_set_result, cidr, NULL);
+
+cmdline_parse_inst_t cmd_ifcfg4_set = {
+	.f = cmd_ifcfg4_set_parsed,
+	.data = NULL,
+	.help_str = "ifcfg4 set <port> <ip/cidr>",
+	.tokens = {
+		(void *)&cmd_ifcfg4_set_ifcfg4,
+		(void *)&cmd_ifcfg4_set_set,
+		(void *)&cmd_ifcfg4_set_port,
+		(void *)&cmd_ifcfg4_set_cidr,
+		NULL,
+	},
+};
+
+cmdline_parse_token_string_t cmd_ifcfg4_clear_ifcfg4 =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_clear_result, ifcfg4, "ifcfg4");
+cmdline_parse_token_string_t cmd_ifcfg4_clear_clear =
+	TOKEN_STRING_INITIALIZER(struct cmd_ifcfg4_clear_result, clear, "clear");
+cmdline_parse_token_num_t cmd_ifcfg4_clear_port =
+	TOKEN_NUM_INITIALIZER(struct cmd_ifcfg4_clear_result, port, RTE_UINT32);
+
+cmdline_parse_inst_t cmd_ifcfg4_clear = {
+	.f = cmd_ifcfg4_clear_parsed,
+	.data = NULL,
+	.help_str = "ifcfg4 clear <port>",
+	.tokens = {
+		(void *)&cmd_ifcfg4_clear_ifcfg4,
+		(void *)&cmd_ifcfg4_clear_clear,
+		(void *)&cmd_ifcfg4_clear_port,
+		NULL,
+	},
+};
+
 cmdline_parse_token_string_t cmd_route6_list_route6 =
 	TOKEN_STRING_INITIALIZER(struct cmd_route6_list_result, route6, "route6");
 cmdline_parse_token_string_t cmd_route6_list_list =
@@ -1859,6 +2054,9 @@ cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_ifcfg6_show,
 	(cmdline_parse_inst_t *)&cmd_ifcfg6_set,
 	(cmdline_parse_inst_t *)&cmd_ifcfg6_clear,
+	(cmdline_parse_inst_t *)&cmd_ifcfg4_show,
+	(cmdline_parse_inst_t *)&cmd_ifcfg4_set,
+	(cmdline_parse_inst_t *)&cmd_ifcfg4_clear,
 	(cmdline_parse_inst_t *)&cmd_route6_list,
 	(cmdline_parse_inst_t *)&cmd_route6_add,
 	(cmdline_parse_inst_t *)&cmd_route6_del,
@@ -2016,6 +2214,10 @@ int main(int argc, char **argv) {
 	const struct rte_memzone *rt6 = rte_memzone_lookup(ROUTE6_SHARED_NAME);
 	if (rt6) {
 		route6_shared_cfg = (struct route6_shared_cfg *)rt6->addr;
+	}
+	const struct rte_memzone *pcfgmz = rte_memzone_lookup(PORTCFG_SHARED_NAME);
+	if (pcfgmz) {
+		portcfg_shared_cfg = (struct portcfg_shared_cfg *)pcfgmz->addr;
 	}
 	const struct rte_memzone *amz = rte_memzone_lookup(ATTACK_SHARED_NAME);
 	if (amz) {

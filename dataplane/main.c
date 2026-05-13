@@ -63,6 +63,7 @@
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
 #include "ipc/route6_ipc.h"
+#include "ipc/portcfg_ipc.h"
 #include "ipc/attack_ipc.h"
 #include "nd/nd.h"
 #include "route/route.h"
@@ -169,6 +170,7 @@ static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
+static struct portcfg_shared_cfg *portcfg_shared_cfg;
 static struct attack_shared_cfg *attack_shared_cfg;
 static uint64_t session_timeout_tsc;
 
@@ -778,6 +780,20 @@ static int route6_ipc_init(void) {
 	return 0;
 }
 
+static int portcfg_ipc_init(void) {
+	const struct rte_memzone *mz = rte_memzone_reserve(PORTCFG_SHARED_NAME, sizeof(struct portcfg_shared_cfg),
+		rte_socket_id(), 0);
+	if (!mz) {
+		return -1;
+	}
+	portcfg_shared_cfg = mz->addr;
+	memset(portcfg_shared_cfg, 0, sizeof(*portcfg_shared_cfg));
+	rte_atomic64_init(&portcfg_shared_cfg->version);
+	rte_wmb();
+	rte_atomic64_set(&portcfg_shared_cfg->version, 1);
+	return 0;
+}
+
 static int attack_ipc_init(void) {
 	const struct rte_memzone *mz = rte_memzone_reserve(ATTACK_SHARED_NAME, sizeof(struct attack_shared_cfg),
 		rte_socket_id(), 0);
@@ -1283,6 +1299,31 @@ static void route6_apply_shared_cfg(void) {
 	rte_atomic32_set(&ipv6_rt_active_idx, next);
 	ipv6_rt_tbls[cur] = NULL;
 	ipv6_rt_reclaim = old_rt;
+
+	last_version = v2;
+}
+
+static void portcfg_apply_shared_cfg(void) {
+	static uint64_t last_version;
+	if (!portcfg_shared_cfg) {
+		return;
+	}
+	uint64_t v = rte_atomic64_read(&portcfg_shared_cfg->version);
+	if (v == 0 || v == last_version) {
+		return;
+	}
+	uint64_t v1 = v;
+	rte_rmb();
+	uint64_t v2 = rte_atomic64_read(&portcfg_shared_cfg->version);
+	if (v2 != v1) {
+		return;
+	}
+
+	for (uint16_t p = 0; p < RTE_MAX_ETHPORTS && p < PORTCFG_MAX_PORTS; p++) {
+		ifcfgs[p].ip = portcfg_shared_cfg->ports[p].ip;
+		ifcfgs[p].mask = portcfg_shared_cfg->ports[p].mask;
+		ifcfgs[p].configured = portcfg_shared_cfg->ports[p].configured;
+	}
 
 	last_version = v2;
 }
@@ -2085,6 +2126,7 @@ l2fwd_main_loop(void)
 						rlim_apply_shared_cfg();
 						route6_reclaim();
 						route6_apply_shared_cfg();
+						portcfg_apply_shared_cfg();
 						session_expire_all(now);
 						session_shared_sync(now);
 						session6_expire_all(now);
@@ -3107,6 +3149,8 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Cannot init denylog6 IPC\n");
 	if (route6_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init route6 IPC\n");
+	if (portcfg_ipc_init() != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init portcfg IPC\n");
 	if (attack_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init attack IPC\n");
 	if (acl_hit_ipc_init() != 0)
