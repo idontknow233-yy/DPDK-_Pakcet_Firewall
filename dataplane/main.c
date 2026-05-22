@@ -76,8 +76,8 @@ static volatile bool force_quit;
 /* MAC updating enabled by default */
 static int mac_updating = 1;
  
-/* Ports set in promiscuous mode on by default. */
-static int promiscuous_on = 1;
+/* Ports set in promiscuous mode off by default. Use -P to enable */
+static int promiscuous_on = 0;
  
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
  
