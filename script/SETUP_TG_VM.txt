@@ -1,0 +1,89 @@
+发包 VM DPDK 配置步骤
+=====================
+
+## 1. VMware 创建发包 VM
+
+网络适配器:
+  - 类型: VMXNET3
+  - 网络: VMnet2 (和 FW 的 ens160 同网络)
+  - 其他: 1 vCPU, 512MB RAM, Ubuntu Server 22.04
+
+验证: 发包 VM 和 FW VM 上互相 ping 通 (在绑定 VFIO 之前测试)
+
+  发包VM: sudo ip addr add 192.168.100.10/24 dev ens192
+  FW VM:  sudo ip addr add 192.168.100.20/24 dev ens160
+  发包VM: ping 192.168.100.20    # 必须通
+
+## 2. DPDK 环境配置
+
+sudo su
+
+# 大页
+echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+
+# 确认
+grep Huge /proc/meminfo
+# 期望: HugePages_Total: 512, Hugepagesize: 2048 kB
+
+## 3. 传输 DPDK 24.11 库文件
+
+在 FW VM 打包:
+  cd /home/yy/dpdk/dpdk-stable-24.11.4
+  tar czf /tmp/dpdk_libs.tgz dpdklib/lib/x86_64-linux-gnu/
+
+scp 到发包VM:
+  scp /tmp/dpdk_libs.tgz user@<发包VM_IP>:/tmp/
+
+在发包 VM 解压:
+  cd /home/user
+  tar xzf /tmp/dpdk_libs.tgz
+
+## 4. 传输发包程序
+
+在 FW VM:
+  scp /home/yy/DPDK_Packet_Firewall/build/tg_dpdk user@<发包VM_IP>:~/
+  scp /home/yy/DPDK_Packet_Firewall/script/tg_run.sh user@<发包VM_IP>:~/
+
+在发包 VM:
+  chmod +x tg_dpdk tg_run.sh
+  # 修改 tg_run.sh 中的 DPDK_LIB 路径:
+  # DPDK_LIB="/home/user/dpdklib/lib/x86_64-linux-gnu"
+
+## 5. 验证 DPDK 发包器
+
+# 5a. 确认库路径正确
+  LD_LIBRARY_PATH=/home/user/dpdklib/lib/x86_64-linux-gnu ldd ./tg_dpdk | grep "not found"
+  # 输出应该为空 (无缺失库)
+
+# 5b. 测试 AF_PACKET 发包
+  sudo LD_LIBRARY_PATH=/home/user/dpdklib/lib/x86_64-linux-gnu \
+    ./tg_dpdk --no-pci --file-prefix tg \
+    --vdev="net_af_packet0,iface=ens192" -l 0 --proc-type=primary -- \
+    64 5 ff:ff:ff:ff:ff:ff
+
+  期望输出:
+    PKTGEN: port=0 pkt=64 dst=ff:ff:ff:ff:ff:ff dur=5
+    PKTGEN: XXXXX pps | XXX.X Mbps | XXXXX total
+    PKTGEN_DONE: XXXXXX
+
+# 5c. 在 FW VM 用 tcpdump 验证能收到包
+  在 FW VM (VIFO 解绑后, ens160 回 kernel 驱动):
+    sudo tcpdump -i ens160 -c 10
+  发包 VM 运行发包器 (dst=ens160 MAC):
+    sudo ... ./tg_dpdk ... 64 5 00:0c:29:fb:49:f3
+  期望看到 UDP 包
+
+## 6. 正式测试流程
+
+终端1 (FW VM):
+  sudo bash /home/yy/DPDK_Packet_Firewall/script/throughput_test.sh
+
+终端2 (发包 VM):
+  sudo bash tg_run.sh
+
+操作顺序:
+  1. FW VM: 启动 throughput_test.sh (自动绑定NIC+启动FW)
+  2. 发包 VM: 按序跑 tg_run.sh (每个包大小 FW脚本会提示按 Enter)
+  3. FW VM 每个包大小: 发包结束后按 Enter 记录结果

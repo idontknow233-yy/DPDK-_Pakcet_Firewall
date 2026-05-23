@@ -78,6 +78,13 @@ static int mac_updating = 1;
  
 /* Ports set in promiscuous mode off by default. Use -P to enable */
 static int promiscuous_on = 0;
+
+/* Built-in packet generator (enabled via --pktgen) */
+static int pktgen_port = -1;
+static uint16_t pktgen_pkt_size = 64;
+static struct rte_ether_addr pktgen_dst_mac;
+static struct rte_mempool *pktgen_mbuf_pool;
+static volatile int pktgen_running;
  
 #define RTE_LOGTYPE_L2FWD RTE_LOGTYPE_USER1
  
@@ -2166,10 +2173,135 @@ l2fwd_main_loop(void)
 		/* >8 End of read packet from RX queues. */
 	}
 }
- 
+
+static int
+parse_pktgen(const char *arg)
+{
+	unsigned port, b[6];
+	uint16_t sz;
+	if (sscanf(arg, "%u,%hu,%02x:%02x:%02x:%02x:%02x:%02x",
+	           &port, &sz, &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) != 8)
+		return -1;
+	if (port >= RTE_MAX_ETHPORTS || sz < 64)
+		return -1;
+	pktgen_port = (int)port;
+	pktgen_pkt_size = sz;
+	for (int i = 0; i < 6; i++)
+		pktgen_dst_mac.addr_bytes[i] = (uint8_t)b[i];
+	return 0;
+}
+
+#define PKTGEN_TX_BURST 64
+
+static void
+pktgen_main_loop(void)
+{
+	unsigned lcore_id = rte_lcore_id();
+	uint16_t port = (uint16_t)pktgen_port;
+
+	fprintf(stderr, "PKTGEN: lcore=%u port=%u start\n", lcore_id, port);
+
+	/* test: single alloc */
+	struct rte_mbuf *m = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+	fprintf(stderr, "PKTGEN: single alloc=%p\n", (void *)m);
+	if (m) {
+		rte_pktmbuf_free(m);
+		fprintf(stderr, "PKTGEN: single alloc OK, entering loop\n");
+	} else {
+		fprintf(stderr, "PKTGEN: single alloc FAILED\n");
+		return;
+	}
+
+	uint64_t total = 0, prev_total = 0;
+	uint64_t ts = rte_rdtsc();
+	uint64_t hz = rte_get_tsc_hz();
+
+	while (!force_quit) {
+		/* alloc one by one */
+		struct rte_mbuf *pkts[PKTGEN_TX_BURST];
+		int i;
+		for (i = 0; i < PKTGEN_TX_BURST; i++) {
+			pkts[i] = rte_pktmbuf_alloc(l2fwd_pktmbuf_pool);
+			if (!pkts[i]) break;
+		}
+		int nb_alloc = i;
+		if (nb_alloc == 0) continue;
+
+		for (int i = 0; i < nb_alloc; i++) {
+			struct rte_mbuf *m = pkts[i];
+			m->data_len = m->pkt_len = pktgen_pkt_size;
+
+			struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m,
+				struct rte_ether_hdr *);
+			rte_ether_addr_copy(&pktgen_dst_mac, &eth->dst_addr);
+			rte_ether_addr_copy(&l2fwd_ports_eth_addr[port],
+			                    &eth->src_addr);
+			eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+			uint16_t pl = pktgen_pkt_size -
+				(uint16_t)(sizeof(*eth) +
+				 sizeof(struct rte_ipv4_hdr) +
+				 sizeof(struct rte_udp_hdr));
+			struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(eth + 1);
+			memset(ip4, 0, sizeof(*ip4));
+			ip4->version_ihl = 0x45;
+			ip4->total_length = rte_cpu_to_be_16(
+				(uint16_t)(sizeof(*ip4) +
+				 sizeof(struct rte_udp_hdr) + pl));
+			ip4->time_to_live = 64;
+			ip4->next_proto_id = IPPROTO_UDP;
+			ip4->src_addr = rte_cpu_to_be_32(0x0a000001);
+			ip4->dst_addr = rte_cpu_to_be_32(0x0a000002);
+			ip4->hdr_checksum = rte_ipv4_cksum(ip4);
+
+			struct rte_udp_hdr *udp =
+				(struct rte_udp_hdr *)(ip4 + 1);
+			udp->src_port = rte_cpu_to_be_16(12345);
+			udp->dst_port = rte_cpu_to_be_16(80);
+			udp->dgram_len = rte_cpu_to_be_16(
+				(uint16_t)(sizeof(*udp) + pl));
+			udp->dgram_cksum = 0;
+		}
+
+		uint16_t sent = rte_eth_tx_burst(port, 0, pkts,
+		                                 (uint16_t)nb_alloc);
+		for (uint16_t i = sent; i < (uint16_t)nb_alloc; i++)
+			rte_pktmbuf_free(pkts[i]);
+
+		total += sent;
+
+		if (rte_rdtsc() - ts >= hz) {
+			uint64_t delta = total - prev_total;
+			double sec = (double)hz / rte_get_tsc_hz();
+			double pps = (double)delta / sec;
+			double mbps = pps * pktgen_pkt_size * 8 / 1e6;
+			printf("PKTGEN: %lu total | %.0f pps | %.1f Mbps\n",
+			       (unsigned long)total, pps, mbps);
+			fflush(stdout);
+			prev_total = total;
+			ts = rte_rdtsc();
+		}
+	}
+}
+
 static int
 l2fwd_launch_one_lcore(__rte_unused void *dummy)
 {
+	unsigned lcore_id = rte_lcore_id();
+	unsigned i;
+	struct lcore_queue_conf *qconf = &lcore_queue_conf[lcore_id];
+
+	if (pktgen_port >= 0 && qconf->n_rx_port == 1 &&
+	    qconf->rx_port_list[0] == (unsigned)pktgen_port) {
+		pktgen_main_loop();
+		return 0;
+	}
+
+	for (i = 0; i < qconf->n_rx_port; i++) {
+		if ((unsigned)pktgen_port == qconf->rx_port_list[i])
+			return 0;
+	}
+
 	l2fwd_main_loop();
 	return 0;
 }
@@ -2180,7 +2312,7 @@ l2fwd_usage(const char *prgname)
 {
 	printf("%s [EAL options] -- -p PORTMASK [-P] [-q NQ]\n"
 	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
-	       "  -P : Enable promiscuous mode (default on)\n"
+	       "  -P : Enable promiscuous mode (default off)\n"
 	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
 	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n"
 	       "  --no-mac-updating: Disable MAC addresses updating (enabled by default)\n"
@@ -2195,7 +2327,9 @@ l2fwd_usage(const char *prgname)
 	       "  --rlim-syn PPS[,BURST]: Per-source TCP SYN rate limit (0 disables)\n"
 	       "  --rlim-udp PPS[,BURST]: Per-source UDP rate limit (0 disables)\n"
 	       "  --portmap: Configure forwarding port pair mapping\n"
-	       "	      Default: alternate port pairs\n\n",
+	       "	      Default: alternate port pairs\n"
+	       "  --pktgen PORT,SIZE,MAC: Enable built-in pktgen on PORT with SIZE-byte pkts\n"
+	       "         Example: --pktgen 2,64,00:0c:29:fb:49:f3\n\n",
 	       prgname);
 }
  
@@ -2587,6 +2721,7 @@ static const char short_options[] =
 #define CMD_LINE_OPT_SESSION_TIMEOUT "session-timeout-sec"
 #define CMD_LINE_OPT_RLIM_SYN "rlim-syn"
 #define CMD_LINE_OPT_RLIM_UDP "rlim-udp"
+#define CMD_LINE_OPT_PKTGEN "pktgen"
  
 enum {
 	/* long options mapped to a short option */
@@ -2602,6 +2737,7 @@ enum {
 	CMD_LINE_OPT_SESSION_TIMEOUT_NUM,
 	CMD_LINE_OPT_RLIM_SYN_NUM,
 	CMD_LINE_OPT_RLIM_UDP_NUM,
+	CMD_LINE_OPT_PKTGEN_NUM,
 };
  
 static const struct option lgopts[] = {
@@ -2615,6 +2751,7 @@ static const struct option lgopts[] = {
 	{ CMD_LINE_OPT_SESSION_TIMEOUT, 1, 0, CMD_LINE_OPT_SESSION_TIMEOUT_NUM},
 	{ CMD_LINE_OPT_RLIM_SYN, 1, 0, CMD_LINE_OPT_RLIM_SYN_NUM},
 	{ CMD_LINE_OPT_RLIM_UDP, 1, 0, CMD_LINE_OPT_RLIM_UDP_NUM},
+	{ CMD_LINE_OPT_PKTGEN, 1, 0, CMD_LINE_OPT_PKTGEN_NUM},
 	{NULL, 0, 0, 0}
 };
  
@@ -2733,6 +2870,14 @@ l2fwd_parse_args(int argc, char **argv)
 		case CMD_LINE_OPT_RLIM_UDP_NUM:
 			if (parse_rlim_arg(optarg, &rlim_udp_pps, &rlim_udp_burst) != 0) {
 				fprintf(stderr, "Invalid rlim-udp\n");
+				l2fwd_usage(prgname);
+				return -1;
+			}
+			break;
+
+		case CMD_LINE_OPT_PKTGEN_NUM:
+			if (parse_pktgen(optarg) != 0) {
+				fprintf(stderr, "Invalid pktgen, use: port,size,xx:xx:xx:xx:xx:xx\n");
 				l2fwd_usage(prgname);
 				return -1;
 			}
@@ -3036,6 +3181,19 @@ main(int argc, char **argv)
 	if (l2fwd_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
 	/* >8 End of create the mbuf pool. */
+
+	if (pktgen_port >= 0) {
+		unsigned pktgen_nb_mbufs = 16384;
+		char pktgen_pool_name[32];
+		snprintf(pktgen_pool_name, sizeof(pktgen_pool_name),
+		         "pktgen_pool_%d", pktgen_port);
+		pktgen_mbuf_pool = rte_pktmbuf_pool_create(
+			pktgen_pool_name, pktgen_nb_mbufs,
+			256, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+			rte_socket_id());
+		if (pktgen_mbuf_pool == NULL)
+			rte_exit(EXIT_FAILURE, "Cannot init pktgen mbuf pool\n");
+	}
 
 	if (routing_on) {
 		arp_tbl = arp_table_create("arp_cache", rte_socket_id(), 2048, 300, 500);
