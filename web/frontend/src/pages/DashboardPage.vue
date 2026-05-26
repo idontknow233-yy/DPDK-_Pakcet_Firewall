@@ -146,16 +146,16 @@ async function refresh() {
 
   chartRules?.setOption({
     xAxis: { data: rulesXs },
-    series: [{ data: rulesYs }]
-  }, { replaceMerge: ['series'] })
+    series: [{ data: rulesYs, type: 'line', smooth: true, showSymbol: false }]
+  })
   chartTraffic?.setOption({
     xAxis: { data: trafficXs },
     series: [
-      { data: trafficRx },
-      { data: trafficTx },
-      { data: trafficDrop }
+      { name: 'rx_pps', data: trafficRx, type: 'line', smooth: true, showSymbol: false },
+      { name: 'tx_pps', data: trafficTx, type: 'line', smooth: true, showSymbol: false },
+      { name: 'drop_pps', data: trafficDrop, type: 'line', smooth: true, showSymbol: false }
     ]
-  }, { replaceMerge: ['series'] })
+  })
 }
 
 onMounted(() => {
@@ -204,5 +204,5 @@ onUnmounted(() => {
 .dash-chart__head { display:flex; align-items:center; justify-content:space-between; margin-bottom: 8px; }
 .dash-chart__title { font-weight: 600; }
 .dash-chart__meta { color: #909399; font-size: 12px; }
-.dash-chart { height: 320px; }
+.dash-chart { width: 100%; height: 320px; }
 </style>

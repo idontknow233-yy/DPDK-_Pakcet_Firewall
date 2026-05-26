@@ -94,8 +94,11 @@ echo "[$(timestamp)] start.sh: ROOT_DIR=${ROOT_DIR}"
 echo "[$(timestamp)] start.sh: LOG_DIR=${LOG_DIR}"
 
 run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:02:08.0
+run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:03:00.0
+run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:0b:00.0
+run_step "devbind" /home/yy/dpdk/dpdk-stable-24.11.4/usertools/dpdk-devbind.py --noiommu-mode -b vfio-pci 0000:13:00.0
 
-start_bg "dataplane" /home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall -l 0-3 -n 4 --proc-type=primary -- -p 0x1 -P
+start_bg "dataplane" /home/yy/DPDK_Packet_Firewall/build/dataplane/dpdk_packet_firewall -l 0-3 -n 4 --proc-type=primary -- -p 0xf -P  --no-mac-updating
 
 echo "[$(timestamp)] [dataplane] 等待 dataplane 完全初始化..."
 for i in {1..50}; do
