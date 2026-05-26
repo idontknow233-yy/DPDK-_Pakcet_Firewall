@@ -91,6 +91,23 @@ export async function clearRoute6(): Promise<void> {
   await api.delete('/api/route6/')
 }
 
+export async function getRoute4(): Promise<{ version: number; count: number; routes: { index: number; dst: string; nh: string; port: number }[] }> {
+  const { data } = await api.get('/api/route4')
+  return data
+}
+
+export async function addRoute4(dst: string, nh: string, port: number): Promise<void> {
+  await api.post('/api/route4', { dst, nh, port })
+}
+
+export async function deleteRoute4(index: number): Promise<void> {
+  await api.delete(`/api/route4/${index}`)
+}
+
+export async function clearRoute4(): Promise<void> {
+  await api.delete('/api/route4/')
+}
+
 export type AttackSnapshot = {
   version: number
   mitigation: number

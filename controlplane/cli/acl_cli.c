@@ -35,6 +35,7 @@
 #include "ipc/session6_ipc.h"
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
+#include "ipc/route_ipc.h"
 #include "ipc/route6_ipc.h"
 #include "ipc/portcfg_ipc.h"
 #include "ipc/attack_ipc.h"
@@ -54,6 +55,7 @@ static struct portstats_shared_cfg *portstats_shared_cfg;
 static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
+static struct route_shared_cfg *route_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
 static struct portcfg_shared_cfg *portcfg_shared_cfg;
 static struct attack_shared_cfg *attack_shared_cfg;
@@ -227,11 +229,35 @@ struct cmd_route6_del_result {
 };
 
 struct cmd_route6_add_result {
-	cmdline_fixed_string_t route6;
-	cmdline_fixed_string_t add;
-	cmdline_fixed_string_t dst;
-	cmdline_fixed_string_t nh;
-	uint32_t port;
+    cmdline_fixed_string_t route6;
+    cmdline_fixed_string_t add;
+    cmdline_fixed_string_t dst;
+    cmdline_fixed_string_t nh;
+    uint32_t port;
+};
+
+struct cmd_route_list_result {
+    cmdline_fixed_string_t route;
+    cmdline_fixed_string_t list;
+};
+
+struct cmd_route_clear_result {
+    cmdline_fixed_string_t route;
+    cmdline_fixed_string_t clear;
+};
+
+struct cmd_route_del_result {
+    cmdline_fixed_string_t route;
+    cmdline_fixed_string_t del;
+    uint32_t index;
+};
+
+struct cmd_route_add_result {
+    cmdline_fixed_string_t route;
+    cmdline_fixed_string_t add;
+    cmdline_fixed_string_t dst;
+    cmdline_fixed_string_t nh;
+    uint32_t port;
 };
 
 struct cmd_attack_show_result {
@@ -1325,7 +1351,113 @@ static void cmd_route6_add_parsed(void *parsed_result, struct cmdline *cl, void 
 	rte_wmb();
 	uint64_t v = rte_atomic64_read(&route6_shared_cfg->version);
 	rte_atomic64_set(&route6_shared_cfg->version, v + 1);
-	cmdline_printf(cl, "route6 add ok\n");
+    cmdline_printf(cl, "route6 add ok\n");
+}
+
+static void cmd_route_list_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+    (void)parsed_result;
+    (void)data;
+    if (!route_shared_cfg) {
+        cmdline_printf(cl, "ROUTE: 0 (version 0)\n");
+        return;
+    }
+    uint64_t v = rte_atomic64_read(&route_shared_cfg->version);
+    uint32_t c = route_shared_cfg->route_count;
+    if (c > ROUTE_MAX) {
+        c = ROUTE_MAX;
+    }
+    cmdline_printf(cl, "ROUTE: %u (version %" PRIu64 ")\n", c, v);
+    for (uint32_t i = 0; i < c; i++) {
+        const struct route4_item *r = &route_shared_cfg->routes[i];
+        char dstbuf[INET_ADDRSTRLEN];
+        char nhbuf[INET_ADDRSTRLEN];
+        struct in_addr a;
+        a.s_addr = rte_cpu_to_be_32(r->dst_ip);
+        inet_ntop(AF_INET, &a, dstbuf, sizeof(dstbuf));
+        a.s_addr = rte_cpu_to_be_32(r->next_hop_ip);
+        inet_ntop(AF_INET, &a, nhbuf, sizeof(nhbuf));
+        cmdline_printf(cl, "%u dst=%s/%u nh=%s port=%u\n", i, dstbuf, r->depth, nhbuf, r->out_port);
+    }
+}
+
+static void cmd_route_clear_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+    (void)parsed_result;
+    (void)data;
+    if (!route_shared_cfg) {
+        cmdline_printf(cl, "route clear failed\n");
+        return;
+    }
+    route_shared_cfg->route_count = 0;
+    rte_wmb();
+    uint64_t v = rte_atomic64_read(&route_shared_cfg->version);
+    rte_atomic64_set(&route_shared_cfg->version, v + 1);
+    cmdline_printf(cl, "route clear ok\n");
+}
+
+static void cmd_route_del_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+    (void)data;
+    struct cmd_route_del_result *res = parsed_result;
+    if (!route_shared_cfg) {
+        cmdline_printf(cl, "route del failed\n");
+        return;
+    }
+    uint32_t c = route_shared_cfg->route_count;
+    if (c > ROUTE_MAX) {
+        c = ROUTE_MAX;
+    }
+    if (res->index >= c) {
+        cmdline_printf(cl, "route del failed\n");
+        return;
+    }
+    if (res->index + 1 < c) {
+        memmove(&route_shared_cfg->routes[res->index], &route_shared_cfg->routes[res->index + 1],
+            sizeof(struct route4_item) * (c - res->index - 1));
+    }
+    route_shared_cfg->route_count = c - 1;
+    rte_wmb();
+    uint64_t v = rte_atomic64_read(&route_shared_cfg->version);
+    rte_atomic64_set(&route_shared_cfg->version, v + 1);
+    cmdline_printf(cl, "route del ok\n");
+}
+
+static void cmd_route_add_parsed(void *parsed_result, struct cmdline *cl, void *data) {
+    (void)data;
+    struct cmd_route_add_result *res = parsed_result;
+    if (!route_shared_cfg) {
+        cmdline_printf(cl, "route add failed\n");
+        return;
+    }
+    uint32_t c = route_shared_cfg->route_count;
+    if (c >= ROUTE_MAX) {
+        cmdline_printf(cl, "route add failed\n");
+        return;
+    }
+    uint32_t dst_ip = 0;
+    uint8_t depth = 0;
+    if (parse_ipv4_cidr_str(res->dst, &dst_ip, &depth) != 0) {
+        cmdline_printf(cl, "route add failed\n");
+        return;
+    }
+    uint32_t nh_ip = 0;
+    if (strcmp(res->nh, "0.0.0.0") != 0) {
+        struct in_addr a;
+        if (inet_pton(AF_INET, res->nh, &a) != 1) {
+            cmdline_printf(cl, "route add failed\n");
+            return;
+        }
+        nh_ip = rte_be_to_cpu_32(a.s_addr);
+    }
+    struct route4_item *it = &route_shared_cfg->routes[c];
+    memset(it, 0, sizeof(*it));
+    it->dst_ip = dst_ip;
+    it->depth = depth;
+    it->next_hop_ip = nh_ip;
+    it->out_port = (uint16_t)res->port;
+    route_shared_cfg->route_count = c + 1;
+    rte_wmb();
+    uint64_t v = rte_atomic64_read(&route_shared_cfg->version);
+    rte_atomic64_set(&route_shared_cfg->version, v + 1);
+    cmdline_printf(cl, "route add ok\n");
 }
 
 static void cmd_attack_show_parsed(void *parsed_result, struct cmdline *cl, void *data) {
@@ -2035,6 +2167,82 @@ cmdline_parse_inst_t cmd_route6_add = {
 	},
 };
 
+cmdline_parse_token_string_t cmd_route_list_route =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_list_result, route, "route");
+cmdline_parse_token_string_t cmd_route_list_list =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_list_result, list, "list");
+
+cmdline_parse_inst_t cmd_route_list = {
+    .f = cmd_route_list_parsed,
+    .data = NULL,
+    .help_str = "route list",
+    .tokens = {
+        (void *)&cmd_route_list_route,
+        (void *)&cmd_route_list_list,
+        NULL,
+    },
+};
+
+cmdline_parse_token_string_t cmd_route_clear_route =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_clear_result, route, "route");
+cmdline_parse_token_string_t cmd_route_clear_clear =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_clear_result, clear, "clear");
+
+cmdline_parse_inst_t cmd_route_clear = {
+    .f = cmd_route_clear_parsed,
+    .data = NULL,
+    .help_str = "route clear",
+    .tokens = {
+        (void *)&cmd_route_clear_route,
+        (void *)&cmd_route_clear_clear,
+        NULL,
+    },
+};
+
+cmdline_parse_token_string_t cmd_route_del_route =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_del_result, route, "route");
+cmdline_parse_token_string_t cmd_route_del_del =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_del_result, del, "del");
+cmdline_parse_token_num_t cmd_route_del_index =
+    TOKEN_NUM_INITIALIZER(struct cmd_route_del_result, index, RTE_UINT32);
+
+cmdline_parse_inst_t cmd_route_del = {
+    .f = cmd_route_del_parsed,
+    .data = NULL,
+    .help_str = "route del <index>",
+    .tokens = {
+        (void *)&cmd_route_del_route,
+        (void *)&cmd_route_del_del,
+        (void *)&cmd_route_del_index,
+        NULL,
+    },
+};
+
+cmdline_parse_token_string_t cmd_route_add_route =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_add_result, route, "route");
+cmdline_parse_token_string_t cmd_route_add_add =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_add_result, add, "add");
+cmdline_parse_token_string_t cmd_route_add_dst =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_add_result, dst, NULL);
+cmdline_parse_token_string_t cmd_route_add_nh =
+    TOKEN_STRING_INITIALIZER(struct cmd_route_add_result, nh, NULL);
+cmdline_parse_token_num_t cmd_route_add_port =
+    TOKEN_NUM_INITIALIZER(struct cmd_route_add_result, port, RTE_UINT32);
+
+cmdline_parse_inst_t cmd_route_add = {
+    .f = cmd_route_add_parsed,
+    .data = NULL,
+    .help_str = "route add <dst/prefix> <nexthop|0.0.0.0> <port>",
+    .tokens = {
+        (void *)&cmd_route_add_route,
+        (void *)&cmd_route_add_add,
+        (void *)&cmd_route_add_dst,
+        (void *)&cmd_route_add_nh,
+        (void *)&cmd_route_add_port,
+        NULL,
+    },
+};
+
 cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_acl_add,
 	(cmdline_parse_inst_t *)&cmd_acl_del,
@@ -2057,10 +2265,14 @@ cmdline_parse_ctx_t acl_cmdline_ctx[] = {
 	(cmdline_parse_inst_t *)&cmd_ifcfg4_show,
 	(cmdline_parse_inst_t *)&cmd_ifcfg4_set,
 	(cmdline_parse_inst_t *)&cmd_ifcfg4_clear,
-	(cmdline_parse_inst_t *)&cmd_route6_list,
-	(cmdline_parse_inst_t *)&cmd_route6_add,
-	(cmdline_parse_inst_t *)&cmd_route6_del,
-	(cmdline_parse_inst_t *)&cmd_route6_clear,
+    (cmdline_parse_inst_t *)&cmd_route6_list,
+    (cmdline_parse_inst_t *)&cmd_route6_add,
+    (cmdline_parse_inst_t *)&cmd_route6_del,
+    (cmdline_parse_inst_t *)&cmd_route6_clear,
+    (cmdline_parse_inst_t *)&cmd_route_list,
+    (cmdline_parse_inst_t *)&cmd_route_add,
+    (cmdline_parse_inst_t *)&cmd_route_del,
+    (cmdline_parse_inst_t *)&cmd_route_clear,
 	(cmdline_parse_inst_t *)&cmd_attack_show,
 	(cmdline_parse_inst_t *)&cmd_attack_set,
 	(cmdline_parse_inst_t *)&cmd_ddos_show,
@@ -2215,10 +2427,14 @@ int main(int argc, char **argv) {
 	if (rt6) {
 		route6_shared_cfg = (struct route6_shared_cfg *)rt6->addr;
 	}
-	const struct rte_memzone *pcfgmz = rte_memzone_lookup(PORTCFG_SHARED_NAME);
-	if (pcfgmz) {
-		portcfg_shared_cfg = (struct portcfg_shared_cfg *)pcfgmz->addr;
-	}
+    const struct rte_memzone *pcfgmz = rte_memzone_lookup(PORTCFG_SHARED_NAME);
+    if (pcfgmz) {
+        portcfg_shared_cfg = (struct portcfg_shared_cfg *)pcfgmz->addr;
+    }
+    const struct rte_memzone *rtmz = rte_memzone_lookup(ROUTE_SHARED_NAME);
+    if (rtmz) {
+        route_shared_cfg = (struct route_shared_cfg *)rtmz->addr;
+    }
 	const struct rte_memzone *amz = rte_memzone_lookup(ATTACK_SHARED_NAME);
 	if (amz) {
 		attack_shared_cfg = (struct attack_shared_cfg *)amz->addr;

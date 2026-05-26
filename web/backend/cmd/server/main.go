@@ -62,6 +62,8 @@ func main() {
 	mux.HandleFunc("/api/ifcfg4/", h.Ifcfg4Item)
 	mux.HandleFunc("/api/route6", h.Route6)
 	mux.HandleFunc("/api/route6/", h.Route6Item)
+	mux.HandleFunc("/api/route4", h.Route4)
+	mux.HandleFunc("/api/route4/", h.Route4Item)
 	mux.HandleFunc("/api/attack", h.Attack)
 	mux.HandleFunc("/api/sessions", h.Sessions)
 	mux.HandleFunc("/api/sessions6", h.Sessions6)

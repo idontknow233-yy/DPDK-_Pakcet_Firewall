@@ -62,6 +62,7 @@
 #include "ipc/session6_ipc.h"
 #include "ipc/stats_ipc.h"
 #include "ipc/rlim_ipc.h"
+#include "ipc/route_ipc.h"
 #include "ipc/route6_ipc.h"
 #include "ipc/portcfg_ipc.h"
 #include "ipc/attack_ipc.h"
@@ -176,12 +177,15 @@ static struct portstats_shared_cfg *portstats_shared_cfg;
 static struct denylog_shared_cfg *denylog_shared_cfg;
 static struct denylog6_shared_cfg *denylog6_shared_cfg;
 static struct rlim_shared_cfg *rlim_shared_cfg;
+static struct route_shared_cfg *route_shared_cfg;
 static struct route6_shared_cfg *route6_shared_cfg;
 static struct portcfg_shared_cfg *portcfg_shared_cfg;
 static struct attack_shared_cfg *attack_shared_cfg;
 static uint64_t session_timeout_tsc;
 
-static struct route_table *ipv4_rt;
+static struct route_table *ipv4_rt_tbls[2];
+static rte_atomic32_t ipv4_rt_active_idx;
+static struct route_table *ipv4_rt_reclaim;
 static struct arp_table *arp_tbl;
 static struct arp_ifcfg ifcfgs[RTE_MAX_ETHPORTS];
 static struct nd_table *nd_tbl;
@@ -193,8 +197,13 @@ static rte_atomic32_t ifcfg6_active_idx;
 static int routing_on;
 
 static inline struct route6_table *ipv6_rt_active(void) {
-	uint32_t idx = rte_atomic32_read(&ipv6_rt_active_idx) & 1u;
-	return ipv6_rt_tbls[idx];
+    uint32_t idx = rte_atomic32_read(&ipv6_rt_active_idx) & 1u;
+    return ipv6_rt_tbls[idx];
+}
+
+static inline struct route_table *ipv4_rt_active(void) {
+    uint32_t idx = rte_atomic32_read(&ipv4_rt_active_idx) & 1u;
+    return ipv4_rt_tbls[idx];
 }
 
 static inline struct nd_ifcfg *ifcfg6_active(void) {
@@ -788,17 +797,29 @@ static int route6_ipc_init(void) {
 }
 
 static int portcfg_ipc_init(void) {
-	const struct rte_memzone *mz = rte_memzone_reserve(PORTCFG_SHARED_NAME, sizeof(struct portcfg_shared_cfg),
-		rte_socket_id(), 0);
-	if (!mz) {
-		return -1;
-	}
-	portcfg_shared_cfg = mz->addr;
-	memset(portcfg_shared_cfg, 0, sizeof(*portcfg_shared_cfg));
-	rte_atomic64_init(&portcfg_shared_cfg->version);
-	rte_wmb();
-	rte_atomic64_set(&portcfg_shared_cfg->version, 1);
-	return 0;
+    const struct rte_memzone *mz = rte_memzone_reserve(PORTCFG_SHARED_NAME, sizeof(struct portcfg_shared_cfg),
+        rte_socket_id(), 0);
+    if (!mz) {
+        return -1;
+    }
+    portcfg_shared_cfg = mz->addr;
+    memset(portcfg_shared_cfg, 0, sizeof(*portcfg_shared_cfg));
+    rte_atomic64_init(&portcfg_shared_cfg->version);
+    rte_wmb();
+    rte_atomic64_set(&portcfg_shared_cfg->version, 1);
+    return 0;
+}
+
+static int route_ipc_init(void) {
+    const struct rte_memzone *mz = rte_memzone_reserve(ROUTE_SHARED_NAME, sizeof(struct route_shared_cfg),
+        rte_socket_id(), 0);
+    if (!mz) {
+        return -1;
+    }
+    route_shared_cfg = mz->addr;
+    memset(route_shared_cfg, 0, sizeof(*route_shared_cfg));
+    rte_atomic64_init(&route_shared_cfg->version);
+    return 0;
 }
 
 static int attack_ipc_init(void) {
@@ -1332,7 +1353,91 @@ static void portcfg_apply_shared_cfg(void) {
 		ifcfgs[p].configured = portcfg_shared_cfg->ports[p].configured;
 	}
 
-	last_version = v2;
+    last_version = v2;
+}
+
+static void route_reclaim(void) {
+    if (!ipv4_rt_reclaim) {
+        return;
+    }
+    route_table_free(ipv4_rt_reclaim);
+    ipv4_rt_reclaim = NULL;
+}
+
+static void route_apply_shared_cfg(void) {
+    static uint64_t last_version;
+    if (!route_shared_cfg) {
+        return;
+    }
+    uint64_t v = rte_atomic64_read(&route_shared_cfg->version);
+    if (v == 0 || v == last_version) {
+        return;
+    }
+
+    struct route4_item routes[ROUTE_MAX];
+    uint32_t count = 0;
+    uint64_t v2 = 0;
+    for (int i = 0; i < 200; i++) {
+        uint64_t v1 = rte_atomic64_read(&route_shared_cfg->version);
+        uint32_t c = route_shared_cfg->route_count;
+        if (c > ROUTE_MAX) {
+            c = ROUTE_MAX;
+        }
+        memcpy(routes, route_shared_cfg->routes, sizeof(struct route4_item) * c);
+        rte_rmb();
+        v2 = rte_atomic64_read(&route_shared_cfg->version);
+        if (v1 == v2) {
+            count = c;
+            break;
+        }
+    }
+    if (v2 == 0 || v2 == last_version) {
+        return;
+    }
+
+    uint32_t cur = rte_atomic32_read(&ipv4_rt_active_idx) & 1u;
+    uint32_t next = cur ^ 1u;
+
+    int ipv4_on = 0;
+    for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+        if (ifcfgs[p].configured) {
+            ipv4_on = 1;
+            break;
+        }
+    }
+    if (count) {
+        ipv4_on = 1;
+    }
+
+    struct route_table *new_rt = NULL;
+    if (ipv4_on) {
+        char name[32];
+        snprintf(name, sizeof(name), "ipv4_rt_dyn_%u", next);
+        new_rt = route_table_create(name, rte_socket_id(), 2048);
+        if (new_rt) {
+            for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+                if (!ifcfgs[p].configured) {
+                    continue;
+                }
+                uint32_t depth = (uint32_t)__builtin_popcount(ifcfgs[p].mask);
+                uint32_t net = ifcfgs[p].ip & ifcfgs[p].mask;
+                route_add(new_rt, net, (uint8_t)depth, 0, p);
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                route_add(new_rt, routes[i].dst_ip, routes[i].depth,
+                    routes[i].next_hop_ip, routes[i].out_port);
+            }
+        }
+    }
+
+    struct route_table *old_rt = ipv4_rt_tbls[cur];
+    ipv4_rt_tbls[next] = new_rt;
+    rte_wmb();
+    rte_atomic32_set(&ipv4_rt_active_idx, next);
+    ipv4_rt_tbls[cur] = NULL;
+    ipv4_rt_reclaim = old_rt;
+
+    last_version = v2;
 }
 
 static int acl_runtime_init(void) {
@@ -1816,7 +1921,8 @@ l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
 				ip->hdr_checksum = rte_ipv4_cksum(ip);
 
 				struct route_entry re;
-				if (!ipv4_rt || route_lookup(ipv4_rt, dst_ip, &re) != 0) {
+                struct route_table *rt = ipv4_rt_active();
+                if (!rt || route_lookup(rt, dst_ip, &re) != 0) {
 					rte_pktmbuf_free(m);
 					port_statistics[portid].dropped++;
 					return;
@@ -2131,8 +2237,10 @@ l2fwd_main_loop(void)
 					if (lcore_id == rte_get_main_lcore()) {
 						uint64_t now = rte_get_timer_cycles();
 						rlim_apply_shared_cfg();
-						route6_reclaim();
-						route6_apply_shared_cfg();
+                        route_reclaim();
+                        route_apply_shared_cfg();
+                        route6_reclaim();
+                        route6_apply_shared_cfg();
 						portcfg_apply_shared_cfg();
 						session_expire_all(now);
 						session_shared_sync(now);
@@ -3040,13 +3148,18 @@ main(int argc, char **argv)
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
 
-	rte_atomic32_init(&ipv6_rt_active_idx);
-	rte_atomic32_init(&ifcfg6_active_idx);
-	rte_atomic32_set(&ipv6_rt_active_idx, 0);
-	rte_atomic32_set(&ifcfg6_active_idx, 0);
-	memset(ifcfg6_tbls, 0, sizeof(ifcfg6_tbls));
-	ipv6_rt_tbls[0] = NULL;
-	ipv6_rt_tbls[1] = NULL;
+    rte_atomic32_init(&ipv6_rt_active_idx);
+    rte_atomic32_init(&ifcfg6_active_idx);
+    rte_atomic32_set(&ipv6_rt_active_idx, 0);
+    rte_atomic32_set(&ifcfg6_active_idx, 0);
+    memset(ifcfg6_tbls, 0, sizeof(ifcfg6_tbls));
+    ipv6_rt_tbls[0] = NULL;
+    ipv6_rt_tbls[1] = NULL;
+    rte_atomic32_init(&ipv4_rt_active_idx);
+    rte_atomic32_set(&ipv4_rt_active_idx, 0);
+    ipv4_rt_tbls[0] = NULL;
+    ipv4_rt_tbls[1] = NULL;
+    ipv4_rt_reclaim = NULL;
 	ipv6_rt_reclaim = NULL;
 	attack_scan_ports_per_sec = 50;
 	attack_ban_seconds = 60;
@@ -3199,21 +3312,21 @@ main(int argc, char **argv)
 		arp_tbl = arp_table_create("arp_cache", rte_socket_id(), 2048, 300, 500);
 		if (!arp_tbl)
 			rte_exit(EXIT_FAILURE, "Cannot init ARP table\n");
-		ipv4_rt = route_table_create("ipv4_rt", rte_socket_id(), 2048);
-		if (!ipv4_rt)
-			rte_exit(EXIT_FAILURE, "Cannot init IPv4 route table\n");
+        ipv4_rt_tbls[0] = route_table_create("ipv4_rt", rte_socket_id(), 2048);
+        if (!ipv4_rt_tbls[0])
+            rte_exit(EXIT_FAILURE, "Cannot init IPv4 route table\n");
 
-		for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
-			if (!ifcfgs[p].configured)
-				continue;
-			uint32_t depth = (uint32_t)__builtin_popcount(ifcfgs[p].mask);
-			uint32_t net = ifcfgs[p].ip & ifcfgs[p].mask;
-			route_add(ipv4_rt, net, (uint8_t)depth, 0, p);
-		}
-		for (uint32_t i = 0; i < pending_route_count; i++) {
-			route_add(ipv4_rt, pending_routes[i].dst_ip, pending_routes[i].depth,
-				pending_routes[i].next_hop_ip, pending_routes[i].out_port);
-		}
+        for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
+            if (!ifcfgs[p].configured)
+                continue;
+            uint32_t depth = (uint32_t)__builtin_popcount(ifcfgs[p].mask);
+            uint32_t net = ifcfgs[p].ip & ifcfgs[p].mask;
+            route_add(ipv4_rt_tbls[0], net, (uint8_t)depth, 0, p);
+        }
+        for (uint32_t i = 0; i < pending_route_count; i++) {
+            route_add(ipv4_rt_tbls[0], pending_routes[i].dst_ip, pending_routes[i].depth,
+                pending_routes[i].next_hop_ip, pending_routes[i].out_port);
+        }
 
 		int ipv6_on = 0;
 		for (uint16_t p = 0; p < RTE_MAX_ETHPORTS; p++) {
@@ -3307,8 +3420,11 @@ main(int argc, char **argv)
 		rte_exit(EXIT_FAILURE, "Cannot init denylog6 IPC\n");
 	if (route6_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init route6 IPC\n");
-	if (portcfg_ipc_init() != 0)
-		rte_exit(EXIT_FAILURE, "Cannot init portcfg IPC\n");
+    if (portcfg_ipc_init() != 0)
+        rte_exit(EXIT_FAILURE, "Cannot init portcfg IPC\n");
+	if (route_ipc_init() != 0) {
+		rte_exit(EXIT_FAILURE, "Cannot init route IPC\n");
+	}
 	if (attack_ipc_init() != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init attack IPC\n");
 	if (acl_hit_ipc_init() != 0)
@@ -3480,8 +3596,16 @@ main(int argc, char **argv)
 	acl_runtime_free();
 	pthread_join(acl6_ctrl_thread, NULL);
 	acl6_runtime_free();
-	arp_table_free(arp_tbl);
-	route_table_free(ipv4_rt);
+    arp_table_free(arp_tbl);
+    route_reclaim();
+    if (ipv4_rt_tbls[0]) {
+        route_table_free(ipv4_rt_tbls[0]);
+        ipv4_rt_tbls[0] = NULL;
+    }
+    if (ipv4_rt_tbls[1]) {
+        route_table_free(ipv4_rt_tbls[1]);
+        ipv4_rt_tbls[1] = NULL;
+    }
 	nd_table_free(nd_tbl);
 	route6_reclaim();
 	if (ipv6_rt_tbls[0]) {

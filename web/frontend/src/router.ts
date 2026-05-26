@@ -6,6 +6,7 @@ import DdosPage from './pages/DdosPage.vue'
 import SessionsPage from './pages/SessionsPage.vue'
 import Sessions6Page from './pages/Sessions6Page.vue'
 import Route6Page from './pages/Route6Page.vue'
+import Route4Page from './pages/Route4Page.vue'
 import PortConfigPage from './pages/PortConfigPage.vue'
 import TopologyPage from './pages/TopologyPage.vue'
 import AttackDemoPage from './pages/AttackDemoPage.vue'
@@ -17,6 +18,7 @@ const routes = [
   { path: '/acl', component: AclPage },
   { path: '/acl6', component: Acl6Page },
   { path: '/route6', component: Route6Page },
+  { path: '/route4', component: Route4Page },
   { path: '/port-config', component: PortConfigPage },
   { path: '/ddos', component: DdosPage },
   { path: '/sessions', component: SessionsPage },
